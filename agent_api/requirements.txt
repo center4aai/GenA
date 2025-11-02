@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+docx
+pydantic
+dotenv
+loguru
+chonkie
+langchain
+langchain-openai
+langgraph>=0.1.0
+pymongo
+langchain-mongodb
+langgraph-checkpoint-mongodb
+
+uvicorn
