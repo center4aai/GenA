@@ -2,6 +2,9 @@
   <img src="gena_web/extensions/logo/logo.png" alt="GenA Logo" style="width: 100%; max-width: 800px; height: auto;"/>
 </p>
 
+<div align="center">
+  <a href="https://deepwiki.com/center4aai/GenA"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+</div>
 
 # GenA — Generation & Assessment Framework
 
