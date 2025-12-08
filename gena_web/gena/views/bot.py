@@ -144,9 +144,19 @@ if uploaded_file is not None:
     if response.status_code == 200:
         data = response.json()
         st.success(f"✅ Document successfully splited into chunks. Number of chunks: {data['num_chunks']}")
+        
+        # Извлекаем document_name из document_type для использования в source_document
+        document_name = None
+        if "document_type" in data and isinstance(data["document_type"], dict):
+            document_name = data["document_type"].get("document_name")
+        
+        # Если document_name не найден, используем имя файла как fallback
+        if not document_name:
+            document_name = uploaded_file.name
     else:
         st.error(f"Server error: {response.status_code}")
         st.json(response.text)
+        document_name = uploaded_file.name  # Fallback на имя файла
     
     question_types = st.multiselect(
         "Select question types to generate:",
@@ -200,7 +210,7 @@ if uploaded_file is not None:
                 dataset_payload = {
                     "name": dataset_name,
                     "description": dataset_description,
-                    "source_document": uploaded_file.name,
+                    "source_document": document_name,  # Используем document_name вместо имени файла
                     "questions": [],  # Пустой список вопросов - они будут добавляться по мере обработки
                     "metadata": {
                         "queue_name": queue_name,
@@ -225,19 +235,43 @@ if uploaded_file is not None:
                 
                 # Подготавливаем задачи для добавления в очередь
                 tasks = []
+                skipped_chunks = 0
                 for idx, chunk in enumerate(chunks, 1):
+                    # Извлекаем текст из чанка (может быть словарь или строка)
+                    if isinstance(chunk, dict):
+                        chunk_text = chunk.get("fragment_data", {}).get("combined_text", "")
+                        # Если combined_text пустой, пытаемся получить из других полей
+                        if not chunk_text:
+                            chunk_text = chunk.get("fragment_data", {}).get("content", "")
+                        if not chunk_text:
+                            chunk_text = chunk.get("fragment_data", {}).get("title", "")
+                        # Если все еще пусто, используем строковое представление
+                        if not chunk_text:
+                            chunk_text = str(chunk)
+                    else:
+                        chunk_text = str(chunk)
+                    
+                    # Пропускаем пустые чанки или слишком короткие
+                    if not chunk_text or len(chunk_text.strip()) < 10:
+                        skipped_chunks += 1
+                        st.warning(f"⚠️ Chunk {idx} пропущен: пустой или слишком короткий текст")
+                        continue
+                    
                     for question_type in question_types:
                         task_data = {
                             "chunk_id": idx,
-                            "chunk_text": chunk,
+                            "chunk_text": chunk_text,
                             "question_type": question_type,
-                            "source_document": uploaded_file.name,
+                            "source_document": document_name,  # Используем document_name вместо имени файла
                             "dataset_name": dataset_name,
                             "dataset_id": dataset_result['dataset_id'],  # Добавляем ID датасета
                             "dataset_description": dataset_description,
                             "priority": 1
                         }
                         tasks.append(task_data)
+                
+                if skipped_chunks > 0:
+                    st.info(f"ℹ️ Пропущено {skipped_chunks} пустых чанков из {len(chunks)}")
                 
                 # Добавляем задачи в очередь
                 tasks_response = post(f"/queues/{queue_name}/tasks/", json=tasks)
@@ -280,6 +314,12 @@ if uploaded_file is not None:
             total_questions = len(chunks) * len(question_types)
             
             for idx, chunk in enumerate(chunks, 1):
+                # Извлекаем текст из чанка (может быть словарь или строка)
+                if isinstance(chunk, dict):
+                    chunk_text = chunk.get("fragment_data", {}).get("combined_text", str(chunk))
+                else:
+                    chunk_text = str(chunk)
+                
                 # Генерируем вопросы для каждого типа
                 for question_type in question_types:
                     question_counter += 1
@@ -290,10 +330,11 @@ if uploaded_file is not None:
                     status_text.text(f"Processing chunk {idx}/{total_chunks}, question type: {question_type} ({question_counter}/{total_questions})...")
 
                     payload = {
-                        "prompt": chunk,
+                        "prompt": chunk_text,
                         "question_type": question_type,
                         "source": "user_input",
-                        "chat_id": 12345
+                        "chat_id": 12345,
+                        "source_text": chunk_text
                     }
 
                     try:
@@ -460,7 +501,7 @@ if uploaded_file is not None:
                 dataset_payload = {
                     "name": dataset_name,
                     "description": dataset_description,
-                    "source_document": uploaded_file.name,
+                    "source_document": document_name,  # Используем document_name вместо имени файла
                     "questions": questions_data,
                     "metadata": {
                         "question_types": question_types,

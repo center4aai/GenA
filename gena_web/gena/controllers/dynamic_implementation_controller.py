@@ -9,6 +9,8 @@ import requests
 
 import json
 
+import streamlit as st
+
 def shuffle_questions(questions):
     if not isinstance(questions, list):
         raise TypeError("Ожидается список вопросов")
@@ -95,3 +97,34 @@ def rephrase_questions(dataset_name, questions):
     tasks_response = requests.post(agent_api_endpoint, headers=_headers(), json = payload).json()
 
     return tasks_response
+
+def _norm_options(opt):
+    """Преобразует options (dict или str) в читаемый многострочный текст."""
+    if opt is None:
+        return "—"
+    if isinstance(opt, dict):
+        lines = []
+        for k, v in opt.items():
+            if v not in (None, "", "None"):
+                lines.append(f"{k}: {v}")
+        return "\n".join(lines) if lines else "—"
+    elif isinstance(opt, str):
+        return opt.strip() if opt.strip() else "—"
+    else:
+        return str(opt) if opt else "—"
+
+
+def clear_question_form_cache():
+    """
+    Очищает session_state от ключей, связанных с формой редактирования вопросов.
+    """
+    keys_to_delete = []
+    for k in list(st.session_state.keys()):
+        if k.startswith(("task_", "options_", "answer_", "type_", "prov_", "diff_")):
+            keys_to_delete.append(k)
+        # контекстные ключи вида "<ctx>::type_1"
+        if any(seg in k for seg in ("::task_", "::options_", "::answer_", "::type_", "::prov_", "::diff_")):
+            keys_to_delete.append(k)
+    for k in set(keys_to_delete):
+        del st.session_state[k]
+    st.session_state.pop("edits", None)

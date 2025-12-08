@@ -67,6 +67,18 @@ def create_difficulty_chain() -> Runnable[DifficultyInput, DifficultyOutput]:
 
             chain = chat_prompt | llm | parser
             result = chain.invoke({})
-            return DifficultyOutput(**result)
+            # JsonOutputParser может вернуть словарь или объект Pydantic модели
+            if isinstance(result, dict):
+                return DifficultyOutput(**result)
+            elif isinstance(result, DifficultyOutput):
+                return result
+            else:
+                # Если результат - это что-то другое, пытаемся преобразовать
+                if hasattr(result, 'model_dump'):
+                    return DifficultyOutput(**result.model_dump())
+                elif hasattr(result, 'dict'):
+                    return DifficultyOutput(**result.dict())
+                else:
+                    raise ValueError(f"Unexpected result type: {type(result)}, value: {result}")
 
     return DifficultyRunnable()

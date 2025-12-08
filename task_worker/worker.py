@@ -69,11 +69,19 @@ class TaskWorker:
     
     def process_task(self, task: Dict) -> Optional[Dict]:
         task_id = task["_id"]
-        chunk_text = task["chunk_text"]
+        chunk_text = task.get("chunk_text", "")
         question_type = task["question_type"]
         dataset_id = task.get("dataset_id")
+        chunk_id = task.get("chunk_id", "unknown")
         
-        logger.info(f"Processing task {task_id}: {question_type} question for chunk {task['chunk_id']} (dataset: {dataset_id})")
+        # Проверяем, что chunk_text не пустой
+        if not chunk_text or len(chunk_text.strip()) < 10:
+            error_msg = f"Chunk {chunk_id} is empty or too short (length: {len(chunk_text) if chunk_text else 0})"
+            logger.warning(f"Task {task_id} skipped: {error_msg}")
+            self.update_task_status(task_id, "failed", error=error_msg)
+            return None
+        
+        logger.info(f"Processing task {task_id}: {question_type} question for chunk {chunk_id} (dataset: {dataset_id}, text length: {len(chunk_text)})")
         
         self.update_task_status(task_id, "processing")
         
@@ -81,34 +89,37 @@ class TaskWorker:
             payload = {
                 "prompt": chunk_text,
                 "question_type": question_type,
-                "source": task["source_document"],
-                "chat_id": task["chunk_id"],
+                "source": task.get("source_document", "unknown"),
+                "chat_id": str(chunk_id),
                 "source_text": chunk_text
             }
             
+            # Увеличиваем таймаут для больших чанков (до 5 минут)
+            timeout = 100  # 5 минут для обработки больших чанков
             response = requests.post(
                 f"{self.agent_api_url}/process_prompt/",
                 json=payload,
-                timeout=60
+                timeout=timeout
             )
             
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"Task {task_id} completed successfully")
+                logger.info(f"Task {task_id} completed successfully for chunk {chunk_id}")
                 
                 if dataset_id:
                     self.save_question_to_dataset(task, result)
                 
                 return result
             else:
-                error_msg = f"Agent API error: {response.status_code} - {response.text}"
-                logger.error(error_msg)
+                error_msg = f"Agent API error: {response.status_code} - {response.text[:500]}"
+                logger.error(f"Task {task_id} (chunk {chunk_id}) failed: {error_msg}")
+                logger.debug(f"Chunk text length: {len(chunk_text)}, first 100 chars: {chunk_text[:100]}")
                 self.update_task_status(task_id, "failed", error=error_msg)
                 return None
                 
         except requests.exceptions.Timeout:
-            error_msg = "Request timeout"
-            logger.error(f"Task {task_id} failed: {error_msg}")
+            error_msg = f"Request timeout after {timeout} seconds (chunk length: {len(chunk_text)} chars)"
+            logger.error(f"Task {task_id} (chunk {chunk_id}) failed: {error_msg}")
             self.update_task_status(task_id, "failed", error=error_msg)
             return None
         except Exception as e:
@@ -260,8 +271,12 @@ class TaskWorker:
             if result:
                 task["result"] = result
                 self.update_task_status(task["_id"], "completed", result=result)
-            else:
-                self.update_task_status(task["_id"], "failed")
+            # Статус уже обновлен в process_task при ошибке, не нужно обновлять повторно
+        
+        # Проверяем завершение датасетов только после обработки всех задач в батче
+        # Используем небольшую задержку, чтобы дать время обновиться статусам в БД
+        import time
+        time.sleep(1)
         
         for dataset_id, dataset_task_list in dataset_tasks.items():
             dataset_name = dataset_task_list[0].get("dataset_name", "Unknown")
@@ -272,7 +287,7 @@ class TaskWorker:
         logger.info(f"Polling interval: {self.poll_interval} seconds")
         logger.info(f"Batch size: {self.batch_size}")
         logger.info(f"Task Queue API: {self.task_queue_url}")
-        logger.info(f"Agent API: {self.agent_api_url}")
+        logger.info(f"Agent API: {self.agent_api_url} (using endpoint: {self.agent_api_url}/process_prompt/)")
         logger.info(f"Dataset API: {self.dataset_api_url}")
         
         while True:

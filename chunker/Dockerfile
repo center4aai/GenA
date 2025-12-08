@@ -16,11 +16,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Скачивание модели эмбеддингов
-RUN python -c "from sentence_transformers import SentenceTransformer; model = SentenceTransformer('intfloat/multilingual-e5-large'); model.save('/app/models/multilingual-e5-large')"
-
-# Копирование кода приложения
-COPY . /app
+# Копирование кода приложения (включая docx2json_outline.py)
+COPY . /app/
 
 # Открытие порта
 EXPOSE 8517

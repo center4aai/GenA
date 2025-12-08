@@ -8,7 +8,7 @@ from fastapi import HTTPException, Depends, status
 from pymongo import MongoClient, ASCENDING
 
 from config import JWT_SECRET, JWT_ALGO, ACCESS_TOKEN_EXPIRE_MINUTES
-from config import MONGO_DB_PATH
+from config import MONGO_DB_PATH, MONGO_DB_NAME
 from config import EXPERT_USERNAME, EXPERT_PASSWORD, USER_USERNAME, USER_PASSWORD
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -23,7 +23,7 @@ def get_mongo_client() -> MongoClient:
     return MongoClient(MONGO_DB_PATH)
 
 def users_collection():
-    return get_mongo_client()["gena_db"]["users"]
+    return get_mongo_client()[MONGO_DB_NAME]["users"]
 
 def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)

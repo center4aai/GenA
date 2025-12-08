@@ -54,24 +54,59 @@ async def process_prompt(request: PromptRequest):
     try:
         logger.info(f"Processing prompt for chat_id: {request.chat_id}")
         
-        result = handler.ahandle_prompt(
-            prompt=request.prompt,
-            question_type=request.question_type,
-            source=request.source,
-            chat_id=request.chat_id,
-            source_text=request.source_text or request.prompt,
-            **(request.additional_params or {})
-        )
+        # Убеждаемся, что prompt - это строка (на случай если пришел словарь)
+        prompt_text = request.prompt
+        if isinstance(prompt_text, dict):
+            # Если это словарь чанка, извлекаем текст
+            prompt_text = prompt_text.get("fragment_data", {}).get("combined_text", str(prompt_text))
+            logger.warning(f"Received dict instead of string for prompt, extracted text")
+        
+        source_text = request.source_text or prompt_text
+        if isinstance(source_text, dict):
+            source_text = source_text.get("fragment_data", {}).get("combined_text", str(source_text))
+        
+        # Проверяем additional_params - должен быть словарем
+        additional_params = request.additional_params
+        if additional_params is not None:
+            if not isinstance(additional_params, dict):
+                logger.warning(f"additional_params is not a dict, got {type(additional_params)}, ignoring")
+                additional_params = None
+        
+        # ahandle_prompt не принимает **kwargs, поэтому игнорируем additional_params
+        # Если нужно передать дополнительные параметры, их нужно добавить в сигнатуру функции
+        logger.info(f"Calling ahandle_prompt with chat_id type: {type(request.chat_id)}, value: {request.chat_id}")
+        try:
+            result = handler.ahandle_prompt(
+                prompt=prompt_text,
+                question_type=request.question_type,
+                source=request.source,
+                chat_id=str(request.chat_id),  # Убеждаемся, что chat_id - строка
+                source_text=source_text
+            )
+        except ValueError as ve:
+            if "too many values to unpack" in str(ve):
+                logger.error(f"ValueError with unpacking in ahandle_prompt: {str(ve)}")
+                import traceback
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise
+        except Exception as e:
+            logger.error(f"Exception in ahandle_prompt: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise
         
         return ResponseModel(
             status="success",
             result=result
         )
     except Exception as e:
-        logger.error(f"Error processing prompt: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Error processing prompt: {error_msg}")
+        import traceback
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=error_msg
         )
 
 @app.post("/rephrase_questions/", response_model=ResponseModel)

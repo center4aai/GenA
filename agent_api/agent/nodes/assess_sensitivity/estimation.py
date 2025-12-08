@@ -53,7 +53,7 @@ def create_provocativeness_chain() -> Runnable[ProvocativenessInput, Provocative
         max_tokens=256  # Ограничиваем длину ответа для ускорения
     )
 
-    parser = JsonOutputParser(pydantic_object=StructuredQuestionOutput)
+    parser = JsonOutputParser(pydantic_object=ProvocativenessOutput)
 
 
     class ProvocativenessRunnable(Runnable[ProvocativenessInput, ProvocativenessOutput]):
@@ -71,6 +71,18 @@ def create_provocativeness_chain() -> Runnable[ProvocativenessInput, Provocative
             ])
             chain =  prompt | llm | parser
             result = chain.invoke({})
-            return ProvocativenessOutput(**result)
+            # JsonOutputParser может вернуть словарь или объект Pydantic модели
+            if isinstance(result, dict):
+                return ProvocativenessOutput(**result)
+            elif isinstance(result, ProvocativenessOutput):
+                return result
+            else:
+                # Если результат - это что-то другое, пытаемся преобразовать
+                if hasattr(result, 'model_dump'):
+                    return ProvocativenessOutput(**result.model_dump())
+                elif hasattr(result, 'dict'):
+                    return ProvocativenessOutput(**result.dict())
+                else:
+                    raise ValueError(f"Unexpected result type: {type(result)}, value: {result}")
     
     return ProvocativenessRunnable()

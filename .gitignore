@@ -2,6 +2,7 @@
 /data/
 /docs
 /logs
+/chunker/files_test
 # Mac OS-specific storage files
 .DS_Store
 

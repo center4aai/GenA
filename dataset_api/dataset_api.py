@@ -5,7 +5,7 @@ from datetime import datetime
 import pymongo
 from bson import ObjectId
 import json
-from config import MONGO_DB_PATH, MONGO_HOST, MONGO_PORT, MONGO_USERNAME, MONGO_PASSWORD
+from config import MONGO_DB_PATH, MONGO_HOST, MONGO_PORT, MONGO_USERNAME, MONGO_PASSWORD, MONGO_DB_NAME
 
 from fastapi import Depends
 from auth_router import router as auth_router
@@ -34,7 +34,7 @@ def get_mongo_client():
 
 def get_db():
     client = get_mongo_client()
-    return client.gena_db
+    return client[MONGO_DB_NAME]
 
 # Pydantic models
 class QuestionData(BaseModel):

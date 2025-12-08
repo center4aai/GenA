@@ -27,7 +27,7 @@ class GENAAssistant:
     difficulty_chain: Runnable 
 #    retriever_chain: Runnable
 #    format_output_chain: Runnable
-    checkpointer: BaseCheckpointSaver
+    checkpointer: Optional[BaseCheckpointSaver] = None
 
     def __post_init__(self):
         builder = StateGraph(AgentState)
@@ -49,7 +49,11 @@ class GENAAssistant:
 #        builder.add_edge("search_milvus", "assess_sensitivity")
 #        builder.add_edge("assess_sensitivity", "format_output")
         
-        self.graph = builder.compile(checkpointer=self.checkpointer)
+        # Компилируем граф с чекпоинтером, если он указан
+        if self.checkpointer is not None:
+            self.graph = builder.compile(checkpointer=self.checkpointer)
+        else:
+            self.graph = builder.compile()
 
     def generate_question_node(self, state: AgentState) -> AgentState:
         """Генерация вопроса"""
@@ -65,32 +69,76 @@ class GENAAssistant:
 
     def provocativeness_node(self, state: AgentState) -> AgentState:
         """Оценка чувствительности"""
+        # Убеждаемся, что generated_question - это словарь
+        generated_question = state["generated_question"]
+        if not isinstance(generated_question, dict):
+            if hasattr(generated_question, 'model_dump'):
+                generated_question = generated_question.model_dump()
+            elif hasattr(generated_question, 'dict'):
+                generated_question = generated_question.dict()
+        
         result = self.provocativeness_chain.invoke({
-            "generated_question": state["generated_question"]
+            "generated_question": generated_question
             })
+        
+        # Убеждаемся, что result - это объект ProvocativenessOutput
+        if isinstance(result, dict):
+            provocativeness_score = result.get('provocativeness_score', 0)
+            explanation = result.get('explanation', '')
+        else:
+            provocativeness_score = result.provocativeness_score
+            explanation = result.explanation
+            
         return {
             **state, 
-            "sensitivity_score": {'provocativeness_score':result.provocativeness_score, 'explanation':result.explanation}
+            "sensitivity_score": {'provocativeness_score': provocativeness_score, 'explanation': explanation}
         }
     def difficulty_node(self, state: AgentState) -> AgentState:
         """Оценка сложности вопроса"""
+        # Убеждаемся, что generated_question - это словарь
+        generated_question = state["generated_question"]
+        if not isinstance(generated_question, dict):
+            if hasattr(generated_question, 'model_dump'):
+                generated_question = generated_question.model_dump()
+            elif hasattr(generated_question, 'dict'):
+                generated_question = generated_question.dict()
+        
         result = self.difficulty_chain.invoke({
-            "generated_question": state["generated_question"]
+            "generated_question": generated_question
         })
+        
+        # Убеждаемся, что result - это объект DifficultyOutput
+        if isinstance(result, dict):
+            difficulty = result.get('difficulty', 0)
+            explanation = result.get('explanation', '')
+        else:
+            difficulty = result.difficulty
+            explanation = result.explanation
+            
         return {
             **state,
             "difficulty_score": {
-                "difficulty": result.difficulty,
-                "explanation": result.explanation
+                "difficulty": difficulty,
+                "explanation": explanation
             }
         }
 
     def validation_node(self, state: AgentState) -> AgentState:
         """Валидация качества вопроса"""
+        # Убеждаемся, что generated_question - это словарь
+        generated_question = state["generated_question"]
+        if not isinstance(generated_question, dict):
+            if hasattr(generated_question, 'model_dump'):
+                generated_question = generated_question.model_dump()
+            elif hasattr(generated_question, 'dict'):
+                generated_question = generated_question.dict()
+            else:
+                raise ValueError(f"Unexpected type for generated_question: {type(generated_question)}")
+        
         result = self.validation_chain.invoke({
             "question_type": state["question_type"],
-            "source_text": state["generated_question"]["source_text"],
-            "question": {k: v for k, v in state["generated_question"].items() if k != "source_text"}
+            "source_text": generated_question.get("source_text", ""),
+            "question": {k: v for k, v in generated_question.items() if k != "source_text"}
         })
         return {
             **state, 

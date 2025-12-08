@@ -17,11 +17,11 @@ MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 
 # API и директории
-AGENT_API_URL = os.getenv("AGENT_API_URL","")
+AGENT_API_URL = os.getenv("AGENT_API_URL", "")
 API_CHANKS_URL = os.getenv("API_CHANKS_URL")
 CHUNKS_DIR = os.getenv("CHUNKS_DIR")
-API_GEN_QUE_URL = os.getenv("API_GEN_QUE_URL")
-API_DATASET_URL = os.getenv("API_DATASET_URL")
+API_GEN_QUE_URL = os.getenv("API_GEN_QUE_URL", "")
+API_DATASET_URL = os.getenv("API_DATASET_URL", "")
 MAX_LEN_USER_PROMPT = os.getenv("MAX_LEN_USER_PROMPT")
 
 # Paths
@@ -46,5 +46,4 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 #AUTH_API_URL    = os.getenv("AUTH_API_URL",    "http://dataset-api:8789")
 AUTH_API_URL    = os.getenv("AUTH_API_URL",    "")
 
-#API_DATASET_URL = os.getenv("API_DATASET_URL", "http://dataset-api:8789")
-API_DATASET_URL = os.getenv("API_DATASET_URL", "")
+# API_DATASET_URL уже определен выше на строке 24
