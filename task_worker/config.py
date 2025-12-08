@@ -5,13 +5,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Task Queue API Configuration (now part of dataset_api)
-TASK_QUEUE_API_URL = os.getenv("TASK_QUEUE_API_URL", "http://dev_dataset-api:8789")
+TASK_QUEUE_API_URL = os.getenv("TASK_QUEUE_API_URL", "")
 
 # Agent API Configuration
-AGENT_API_URL = os.getenv("AGENT_API_URL", "http://dev_agent-api:8790")
+AGENT_API_URL = os.getenv("AGENT_API_URL", "")
 
 # Dataset API Configuration
-DATASET_API_URL = os.getenv("DATASET_API_URL", "http://dev_dataset-api:8789")
+DATASET_API_URL = os.getenv("DATASET_API_URL", "")
 # Worker Configuration
 WORKER_POLL_INTERVAL = int(os.getenv("WORKER_POLL_INTERVAL", "5"))  # seconds
 WORKER_BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "5"))
