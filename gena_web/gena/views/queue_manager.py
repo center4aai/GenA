@@ -4,42 +4,51 @@ import requests
 import pandas as pd
 from datetime import datetime
 import time
-from gena.config import API_DATASET_URL, LOGO
-import base64
-import os
+from gena.config import API_DATASET_URL, AGENT_API_URL
 from gena.http import get, post, put, delete
 from collections import Counter
 
 
-def get_base64_image(img_path):
-    with open(img_path, "rb") as img_file:
-        return base64.b64encode(img_file.read()).decode()
+st.title("Queue Manager")
 
-st.title("GENA: Queue Manager")
-
-# Логотип
-if os.path.exists(LOGO):
-    img_base64 = get_base64_image(LOGO)
-    st.markdown(
-        f"""
-        <div style="display: flex; justify-content: center;">
-            <img src="data:image/png;base64,{img_base64}" width="520"/>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+st.markdown(
+    "Monitor task queues, dataset progress, and model health."
+)
 st.markdown("---")
-st.markdown("""
-## 📋 Queue Manager
 
-This page allows you to manage task queues for question generation. You can:
-- View all available queues with their statistics
-- Create new queues
-- Add tasks to queues
-- Monitor task progress
-- Delete queues
-""")
+
+@st.cache_data(ttl=30)
+def _fetch_models_health():
+    try:
+        resp = requests.get(
+            f"{AGENT_API_URL}/models/health/", timeout=10
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
+
+
+def _render_model_health_banner():
+    health = _fetch_models_health()
+    if not health:
+        return {}
+    health_map = {h["id"]: h for h in health}
+    unavailable = [h for h in health if not h["available"]]
+    if unavailable:
+        names = ", ".join(f"**{h['name']}**" for h in unavailable)
+        st.error(
+            f"Models not responding: {names}. "
+            "Tasks using these models will fail until they recover."
+        )
+    else:
+        st.success(f"All {len(health)} models are healthy.")
+    return health_map
+
+
+st.markdown("### Model Health")
+_health_map = _render_model_health_banner()
 
 # Функция для загрузки списка очередей
 def load_queues():
@@ -314,6 +323,33 @@ if queues:
             all_tasks = get_queue_tasks(selected_queue)
             cc = Counter(t.get("status", "unknown") for t in all_tasks)
 
+            # Determine which models are used in this queue's tasks
+            queue_gen_models = set()
+            queue_val_models = set()
+            for t in all_tasks:
+                gm = t.get("generation_model_id")
+                vm = t.get("validation_model_id")
+                if gm:
+                    queue_gen_models.add(gm)
+                if vm:
+                    queue_val_models.add(vm)
+            queue_all_models = queue_gen_models | queue_val_models
+
+            if queue_all_models and _health_map:
+                down_in_queue = [
+                    mid for mid in queue_all_models
+                    if mid in _health_map and not _health_map[mid].get("available", True)
+                ]
+                if down_in_queue:
+                    names = ", ".join(
+                        f"**{_health_map[m].get('name', m)}**" for m in down_in_queue
+                    )
+                    pending_or_processing = cc.get("pending", 0) + cc.get("processing", 0)
+                    st.error(
+                        f"This queue uses models that are currently down: {names}. "
+                        f"{pending_or_processing} pending/processing tasks may fail."
+                    )
+
             st.markdown(f"#### Queue: {selected_queue}")
             col1, col2, col3 = st.columns(3)
             
@@ -351,16 +387,33 @@ if queues:
                 # Отображаем задачи в таблице
                 task_data = []
                 for task in tasks:
-                    # Добавляем информацию об ошибке для failed задач
                     error_info = ""
                     if task.get("status") == "failed" and task.get("error"):
                         error_info = task.get("error", "")[:100] + "..." if len(task.get("error", "")) > 100 else task.get("error", "")
-                    
+
+                    gen_mid = task.get("generation_model_id", "")
+                    val_mid = task.get("validation_model_id", "")
+                    gen_label = gen_mid
+                    val_label = val_mid
+                    if _health_map:
+                        if gen_mid and gen_mid in _health_map:
+                            h = _health_map[gen_mid]
+                            gen_label = h.get("name", gen_mid)
+                            if not h.get("available", True):
+                                gen_label = f"\u26a0 {gen_label}"
+                        if val_mid and val_mid in _health_map:
+                            h = _health_map[val_mid]
+                            val_label = h.get("name", val_mid)
+                            if not h.get("available", True):
+                                val_label = f"\u26a0 {val_label}"
+
                     task_data.append({
                         "Task ID": task["_id"][:8] + "...",
                         "Chunk ID": task.get("chunk_id", ""),
                         "Question Type": task.get("question_type", ""),
                         "Status": task.get("status", ""),
+                        "Gen Model": gen_label,
+                        "Val Model": val_label,
                         "Priority": task.get("priority", ""),
                         "Error": error_info,
                         "Created": task.get("created_at", "")[:19] if task.get("created_at") else "",

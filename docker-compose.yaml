@@ -13,13 +13,13 @@ services:
     restart: unless-stopped
     depends_on:
       - chunker
-      - ruadapt-qwen
+#      - ruadapt-qwen
 
   gena_web:
     build: ./gena_web
     container_name: ${GENA_WEB_CONTAINER_NAME}
     ports:
-      - "27369:8516"
+      - "27371:8516"
     volumes:
       - ./gena_web:/app
     extra_hosts: 
@@ -72,32 +72,32 @@ services:
       - ${GENA_NET}
     restart: unless-stopped
 
-  ruadapt-qwen:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
-    container_name: ${RUADAPT_QWEN_SERVER_CONTAINER_NAME}
-    restart: unless-stopped
-    ports:
-      - "27362:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-    volumes:
-      - /home/ivan/models:/models
-    command: >
-      -m /models/${MODEL_NAME}
-      --parallel 1
-      --ctx-size 16384
-      --port 8000
-      --n-gpu-layers 60
-      --main-gpu 0
-      --tensor-split 1.0
-      -fa
-    runtime: nvidia
-    networks:
-      - ${GENA_NET}
+  # ruadapt-qwen:
+  #   image: ghcr.io/ggml-org/llama.cpp:server-cuda
+  #   container_name: ${RUADAPT_QWEN_SERVER_CONTAINER_NAME}
+  #   restart: unless-stopped
+  #   ports:
+  #     - "27362:8000"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - capabilities: [gpu]
+  #   volumes:
+  #     - /home/ivan/models:/models
+  #   command: >
+  #     -m /models/${MODEL_NAME}
+  #     --parallel 1
+  #     --ctx-size 16384
+  #     --port 8000
+  #     --n-gpu-layers 60
+  #     --main-gpu 0
+  #     --tensor-split 1.0
+  #     -fa
+  #   runtime: nvidia
+  #   networks:
+  #     - ${GENA_NET}
 
 networks:
-  gena_net:
+  dev_gena_net:
     driver: bridge

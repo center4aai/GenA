@@ -26,7 +26,11 @@ class ValidationOutput(BaseModel):
     threshold: int = Field(description="Пороговое значение")
     passed: bool = Field(description="Прошел ли вопрос порог качества")
 
-def create_validation_chain() -> Runnable[ValidationInput, ValidationOutput]:
+def create_validation_chain(
+    model_name: str = None,
+    base_url: str = None,
+    api_key: str = None,
+) -> Runnable[ValidationInput, ValidationOutput]:
     """
     Создает цепочку для валидации вопросов.
     
@@ -36,7 +40,11 @@ def create_validation_chain() -> Runnable[ValidationInput, ValidationOutput]:
     
     class ValidationRunnable(Runnable[ValidationInput, ValidationOutput]):
         def __init__(self):
-            self.validator = LLMValidator()
+            self.validator = LLMValidator(
+                model=model_name,
+                base_url=base_url,
+                api_key=api_key,
+            )
             
         def invoke(self, input_data: ValidationInput) -> ValidationOutput:
             try:

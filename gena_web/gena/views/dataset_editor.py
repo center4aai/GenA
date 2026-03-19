@@ -1,19 +1,13 @@
 import streamlit as st
-import os
 from gena.http import get, post, put, delete
 st.session_state["role"] = "expert"
 is_expert = True
 import pandas as pd
 from datetime import datetime
-from gena.config import API_DATASET_URL, LOGO
-import base64
+from gena.config import API_DATASET_URL
 import plotly.express as px
 from collections import Counter
 import re
-
-def get_base64_image(img_path):
-    with open(img_path, "rb") as img_file:
-        return base64.b64encode(img_file.read()).decode()
 
 def _parse_validation_score(score_str):
     """'17/17' -> (17, 17); иначе -> (None, None)"""
@@ -309,32 +303,12 @@ def _apply_cache_defaults(ctx, i_abs, q):
     st.session_state.setdefault(_k(ctx, "diff", i_abs), str(cached.get("difficulty", q.get("difficulty", "")) or ""))
 
 # ---------- UI ----------
-st.title("GENA: Dataset Editor")
+st.title("Results & Editor")
 
-# Логотип
-if os.path.exists(LOGO):
-    img_base64 = get_base64_image(LOGO)
-    st.markdown(
-        f"""
-        <div style="display: flex; justify-content: center;">
-            <img src="data:image/png;base64,{img_base64}" width="520"/>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+st.markdown(
+    "Browse generated questions, edit inline, compare versions, and export CSV."
+)
 st.markdown("---")
-st.markdown("""
-## 📝 Dataset Editor
-
-This page allows you to view, edit, and manage datasets that have been generated. You can:
-- View all available datasets
-- Select different versions of datasets
-- View source text for each question (click to expand)
-- Edit questions and answers
-- Save changes as new versions
-- Compare different versions
-""")
 
 def load_datasets():
     try:
@@ -411,7 +385,7 @@ else:
     def _short(x):
         return str(x)[:8] if x else "?"
 
-    datasets_sorted = sorted(datasets, key=lambda d: (d.get("name", ""), d.get("_id", "")))
+    datasets_sorted = sorted(datasets, key=lambda d: d.get("created_at", ""), reverse=True)
     by_id = {d["_id"]: d for d in datasets_sorted}
     ids = list(by_id.keys())
 

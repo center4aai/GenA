@@ -14,4 +14,4 @@ COPY . /app
 EXPOSE 8790
 
 # Запуск приложения
-CMD ["uvicorn", "agent_api:app", "--host", "0.0.0.0", "--port", "8790"]
+CMD ["uvicorn", "agent_api:app", "--host", "0.0.0.0", "--port", "8790", "--workers", "4"]

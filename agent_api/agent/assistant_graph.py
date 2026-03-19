@@ -3,6 +3,7 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.runnables import Runnable
 from dataclasses import dataclass
+import random
 
 from typing import Optional
 
@@ -11,12 +12,111 @@ class AgentState(TypedDict):
     chunk: str
     question_type: str
     source: str
+    language: Optional[str]  # ru, be, tg
     generated_question: dict
     sensitivity_score: dict
     difficulty_score: dict
     validation_result: dict
     final_json: dict
     questions: Optional[List[str]] # поле для перефразированных вопросов
+
+
+def shuffle_answer_options(question_data: dict, question_type: str) -> dict:
+    """
+    Перемешивает варианты ответа и обновляет поле outputs с новыми номерами правильных ответов.
+    
+    Args:
+        question_data: Словарь с данными вопроса (option_1, option_2, ..., outputs)
+        question_type: Тип вопроса ("one", "multi", "open")
+    
+    Returns:
+        Обновленный словарь с перемешанными вариантами ответа
+    """
+    # Для типа "open" вариантов ответа нет, ничего не делаем
+    if question_type == "open":
+        return question_data
+    
+    # Преобразуем в словарь, если это Pydantic модель
+    if not isinstance(question_data, dict):
+        if hasattr(question_data, 'model_dump'):
+            question_data = question_data.model_dump()
+        elif hasattr(question_data, 'dict'):
+            question_data = question_data.dict()
+        else:
+            return question_data
+    
+    # Собираем все непустые варианты ответа
+    options = []
+    for i in range(1, 10):
+        key = f"option_{i}"
+        value = question_data.get(key)
+        if value and value not in [None, "None"]:
+            options.append(value)
+    
+    if not options:
+        return question_data
+    
+    # Определяем правильные ответы из поля outputs
+    outputs = question_data.get("outputs", "")
+    if isinstance(outputs, int):
+        outputs = str(outputs)
+    elif not isinstance(outputs, str):
+        outputs = str(outputs)
+    
+    # Парсим правильные ответы
+    if question_type == "one":
+        # Для типа "one" outputs - это один номер (строка или число)
+        try:
+            correct_indices = [int(outputs.strip())]
+        except (ValueError, AttributeError):
+            return question_data
+    elif question_type == "multi":
+        # Для типа "multi" outputs - это номера через запятую без пробелов
+        try:
+            correct_indices = [int(x.strip()) for x in outputs.split(",") if x.strip()]
+        except (ValueError, AttributeError):
+            return question_data
+    else:
+        return question_data
+    
+    # Получаем правильные значения ответов (индексы в options начинаются с 0, а номера option_* с 1)
+    correct_values = []
+    for idx in correct_indices:
+        if 1 <= idx <= len(options):
+            correct_values.append(options[idx - 1])
+    
+    if not correct_values:
+        return question_data
+    
+    # Перемешиваем варианты ответа
+    shuffled_options = options.copy()
+    random.shuffle(shuffled_options)
+    
+    # Обновляем option_1 - option_9
+    # Сначала очищаем все option_*
+    for i in range(1, 10):
+        question_data[f"option_{i}"] = "None"
+    
+    # Заполняем перемешанными значениями
+    for i, value in enumerate(shuffled_options, start=1):
+        question_data[f"option_{i}"] = value
+    
+    # Находим новые номера правильных ответов
+    new_correct_indices = []
+    for i, value in enumerate(shuffled_options, start=1):
+        if value in correct_values:
+            new_correct_indices.append(i)
+    
+    # Обновляем поле outputs
+    if question_type == "one":
+        if new_correct_indices:
+            question_data["outputs"] = str(new_correct_indices[0])
+    elif question_type == "multi":
+        if new_correct_indices:
+            new_correct_indices.sort()
+            question_data["outputs"] = ",".join(map(str, new_correct_indices))
+    
+    return question_data
 
 
 @dataclass
@@ -57,10 +157,20 @@ class GENAAssistant:
 
     def generate_question_node(self, state: AgentState) -> AgentState:
         """Генерация вопроса"""
-        result = self.generate_question_chain.invoke({
+        input_data = {
             "input_text": state["chunk"],
-            "question_type": state["question_type"]
-        })
+            "question_type": state["question_type"],
+            "source": state.get("source", "")
+        }
+        # Добавляем язык, если он указан в состоянии
+        if "language" in state and state.get("language"):
+            input_data["language"] = state["language"]
+        
+        result = self.generate_question_chain.invoke(input_data)
+        
+        # Перемешиваем варианты ответа после генерации
+        result = shuffle_answer_options(result, state["question_type"])
+        
         return {
             **state, 
             "generated_question": result

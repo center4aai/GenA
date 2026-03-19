@@ -78,6 +78,8 @@ class TaskData(BaseModel):
     dataset_id: Optional[str] = None
     dataset_description: Optional[str] = None
     priority: Optional[int] = 1
+    generation_model_id: Optional[str] = None
+    validation_model_id: Optional[str] = None
 
 class QueueCreate(BaseModel):
     name: str
@@ -368,6 +370,8 @@ async def add_tasks_to_queue(
                 "dataset_id": task_data.dataset_id,
                 "dataset_description": task_data.dataset_description,
                 "priority": task_data.priority,
+                "generation_model_id": task_data.generation_model_id,
+                "validation_model_id": task_data.validation_model_id,
                 "status": "pending",
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),

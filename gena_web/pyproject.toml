@@ -7,7 +7,7 @@ name = "gena"
 version = "0.0.1"
 description = "GenA"
 authors = [
-  { name = "RANEPA" },
+  { name = "Contributors" },
 ]
 license = { file = "LICENSE" }
 readme = "README.md"

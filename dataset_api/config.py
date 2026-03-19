@@ -11,7 +11,7 @@ MONGO_USERNAME = os.getenv("MONGO_USERNAME", "")
 MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "")
 MONGO_HOST = os.getenv("MONGO_HOST", "")
 MONGO_PORT = os.getenv("MONGO_PORT", "")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "gena_db_test")
 MONGO_DB_PATH = f"mongodb://{MONGO_USERNAME}:{MONGO_PASSWORD}@{MONGO_HOST}:{MONGO_PORT}/"
 
 
@@ -36,10 +36,10 @@ JWT_SECRET = _load_or_create_secret()
 JWT_ALGO   = os.getenv("JWT_ALGO", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
 
-EXPERT_USERNAME = os.getenv("EXPERT_USERNAME", "admin")
-EXPERT_PASSWORD = os.getenv("EXPERT_PASSWORD", "admin123")
+EXPERT_USERNAME = os.getenv("EXPERT_USERNAME", "")
+EXPERT_PASSWORD = os.getenv("EXPERT_PASSWORD", "")
 
-USER_USERNAME   = os.getenv("USER_USERNAME", "user")
-USER_PASSWORD   = os.getenv("USER_PASSWORD", "user123")
+USER_USERNAME   = os.getenv("USER_USERNAME", "")
+USER_PASSWORD   = os.getenv("USER_PASSWORD", "")
 
 

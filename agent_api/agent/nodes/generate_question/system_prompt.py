@@ -1,4 +1,6 @@
 PROMPT_TEMPLATE_ONE = """
+**Источник**: {source}
+
 **Исходный текст**:
 {original_text}
 
@@ -6,6 +8,8 @@ PROMPT_TEMPLATE_ONE = """
 """
 
 PROMPT_TEMPLATE_MULTI = """
+**Источник**: {source}
+
 **Исходный текст**:
 {original_text}
 
@@ -13,6 +17,8 @@ PROMPT_TEMPLATE_MULTI = """
 """
 
 PROMPT_TEMPLATE_OPEN = """
+**Источник**: {source}
+
 **Исходный текст**:
 
 {original_text}

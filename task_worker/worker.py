@@ -91,8 +91,12 @@ class TaskWorker:
                 "question_type": question_type,
                 "source": task.get("source_document", "unknown"),
                 "chat_id": str(chunk_id),
-                "source_text": chunk_text
+                "source_text": chunk_text,
             }
+            if task.get("generation_model_id"):
+                payload["generation_model_id"] = task["generation_model_id"]
+            if task.get("validation_model_id"):
+                payload["validation_model_id"] = task["validation_model_id"]
             
             # Увеличиваем таймаут для больших чанков (до 5 минут)
             timeout = 100  # 5 минут для обработки больших чанков

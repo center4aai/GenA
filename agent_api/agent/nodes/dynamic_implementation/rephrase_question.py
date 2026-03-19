@@ -14,8 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class RephrasedQuestionOutput(BaseModel):
-    rephrased_question: str = Field(description="Переформулированный вопрос, сохраняющий исходный смысл.")
-    original_question: str = Field(default="", description="Оригинальный вопрос для справки.")
+    rephrased_question: str = Field(
+        description="Переформулированный вопрос, сохраняющий исходный смысл."
+    )
+    original_question: str = Field(
+        default="", description="Оригинальный вопрос для справки."
+    )
 
 
 SYSTEM_PROMPT_REPHRASE = """Ты — эксперт по переформулированию вопросов. Твоя задача — перефразировать входящий вопрос, сохранив его смысл, но изменив формулировку, структуру или стиль.
@@ -40,36 +44,56 @@ def _escape_curly_braces(text: str) -> str:
     return text.replace("{", "{{").replace("}", "}}")
 
 
-def _get_rephrase_chain():
+def _get_rephrase_chain(
+    model_name: str = None,
+    base_url: str = None,
+    api_key: str = None,
+):
     llm = ChatOpenAI(
-        model=LLM_MODEL_NAME,
+        model=model_name or LLM_MODEL_NAME,
         temperature=0.0,
-        openai_api_base=LLM_URL_MODEL,
-        openai_api_key=LLM_API_KEY,
+        openai_api_base=base_url or LLM_URL_MODEL,
+        openai_api_key=api_key or LLM_API_KEY,
         max_retries=3,
-        stream=False,
+        streaming=False,
         timeout=30,
-        max_tokens=256
+        max_tokens=256,
+        model_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
     )
 
     parser = PydanticOutputParser(pydantic_object=RephrasedQuestionOutput)
-    
+
     # Экранируем фигурные скобки в инструкциях парсера!
     format_instructions = _escape_curly_braces(parser.get_format_instructions())
-    
+
     system_prompt = f"{SYSTEM_PROMPT_REPHRASE}\n\n{format_instructions}"
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Переформулируй следующий вопрос:\n\nВопрос: {question}\n\nПереформулированный вопрос:")
-    ])
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            (
+                "human",
+                "Переформулируй следующий вопрос:\n\nВопрос: {question}\n\nПереформулированный вопрос:",
+            ),
+        ]
+    )
 
     return prompt | llm | parser
 
-def rephrase_question(question: str) -> str:
+
+def rephrase_question(
+    question: str,
+    model_name: str = None,
+    base_url: str = None,
+    api_key: str = None,
+) -> str:
     try:
         logger.info(f"Rephrasing question: {question[:60]}...")
-        chain = _get_rephrase_chain()
+        chain = _get_rephrase_chain(
+            model_name=model_name,
+            base_url=base_url,
+            api_key=api_key,
+        )
         result: RephrasedQuestionOutput = chain.invoke({"question": question})
         logger.info(f"Rephrased to: {result.rephrased_question[:60]}...")
         return result.rephrased_question
@@ -78,5 +102,13 @@ def rephrase_question(question: str) -> str:
         return question
 
 
-def rephrase_questions(questions: List[str]) -> List[str]:
-    return [rephrase_question(q) for q in questions]
+def rephrase_questions(
+    questions: List[str],
+    model_name: str = None,
+    base_url: str = None,
+    api_key: str = None,
+) -> List[str]:
+    return [
+        rephrase_question(q, model_name=model_name, base_url=base_url, api_key=api_key)
+        for q in questions
+    ]

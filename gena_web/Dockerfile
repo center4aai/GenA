@@ -14,6 +14,9 @@ RUN pip install extra-streamlit-components
 # Копирование файлов проекта
 COPY . /app
 
+# Streamlit theme
+COPY gena/.streamlit /root/.streamlit
+
 # Установка зависимостей через poetry
 RUN poetry config virtualenvs.create false \
     && poetry install

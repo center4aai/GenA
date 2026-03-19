@@ -1,5 +1,3 @@
-import os
-import base64
 from datetime import datetime
 from collections import defaultdict
 
@@ -9,13 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from gena.http import get
-from gena.config import API_DATASET_URL, LOGO
+from gena.config import API_DATASET_URL
 
-
-
-def get_base64_image(img_path: str) -> str:
-    with open(img_path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
 
 def _parse_validation_score(score_str):
     """'17/21' -> (17, 21); иначе -> (None, None)"""
@@ -92,33 +85,12 @@ def load_dataset(dataset_id, version=None):
         return None
 
 # ---------- UI ----------
-st.title("GENA: Statistics Dashboard")
+st.title("Statistics")
 
-if os.path.exists(LOGO):
-    img_base64 = get_base64_image(LOGO)
-    st.markdown(
-        f"""
-        <div style="display:flex;justify-content:center;">
-            <img src="data:image/png;base64,{img_base64}" width="520"/>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+st.markdown(
+    "Aggregated analytics across datasets: question types, sensitivity, difficulty, validation rates."
+)
 st.markdown("---")
-st.markdown("""
-## 📊 Statistics Dashboard
-
-This page provides comprehensive statistics and analytics for your generated datasets. You can:
-- View overall statistics across all datasets
-- Analyze provocativeness distribution
-- Analyze difficulty distribution  
-            
-- Check validation success rates
-- Monitor question type distribution
-- Track dataset creation trends
-- Monitor processing status and progress
-""")
 
 # ---------- load data ----------
 st.markdown("### 📈 Overall Statistics")
