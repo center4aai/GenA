@@ -1,0 +1,69 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply bg-gena-surface font-sans text-slate-900 antialiased;
+  }
+
+  ::selection {
+    @apply bg-gena-primary/25 text-slate-900;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-lg bg-gena-primary px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-gena-primary-dark focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gena-primary disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-400;
+  }
+
+  .card {
+    @apply rounded-xl border border-slate-200/80 bg-white p-5 shadow-card;
+  }
+
+  .input-field {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm transition-colors placeholder:text-slate-400 focus:border-gena-primary focus:outline-none focus:ring-2 focus:ring-gena-primary/20;
+  }
+
+  .page-title {
+    @apply text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl;
+  }
+
+  .page-subtitle {
+    @apply text-base leading-relaxed text-slate-600;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors;
+  }
+
+  .nav-link-active {
+    @apply bg-gena-primary text-white shadow-sm;
+  }
+
+  .nav-link-inactive {
+    @apply text-stone-300 hover:bg-gena-sidebar-hover hover:text-white;
+  }
+
+  .data-table {
+    @apply min-w-full text-sm;
+  }
+
+  .data-table th {
+    @apply border-b border-slate-200 px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500;
+  }
+
+  .data-table td {
+    @apply border-b border-slate-100 px-3 py-2.5 text-slate-700;
+  }
+}

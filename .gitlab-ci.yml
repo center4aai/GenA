@@ -1,0 +1,170 @@
+# Smoke-тесты (test_smoke_endpoints) выполняются на том же runner после deploy в $PROJECT_DIR.
+#
+# Все пути/имена окружений берутся из GitLab CI/CD Variables:
+#   PROJECT_DIR_DEV       (например, /app/gena_dev)
+#   PROJECT_DIR_MAIN      (например, /app/gena_main)
+#   COMPOSE_PROJECT_DEV   (например, gena_dev)
+#   COMPOSE_PROJECT_MAIN  (например, gena_main)
+#
+# develop -> dev окружение, main -> demo окружение
+# (изолированные БД/контейнеры/сети/порты).
+
+stages:
+  - build
+  - deploy
+  - test
+
+# Общий before_script для build/deploy: работаем в постоянной деплой-директории.
+.in_project_dir: &in_project_dir
+  - git config --global --add safe.directory "$PROJECT_DIR"
+  - cd "$PROJECT_DIR" || exit 1
+
+# Force-rm контейнеров по именам из .env (см. использование через !reference ниже),
+# чтобы исключить коллизии имён между compose-проектами dev/main на одном раннере.
+.cleanup_named_containers:
+  script:
+    - set -a; . ./.env; set +a
+    - |
+      for c in \
+        "$AGENT_API_CONTAINER_NAME" \
+        "$GENA_WEB_CONTAINER_NAME" \
+        "$DATASET_API_CONTAINER_NAME" \
+        "$TASK_WORKER_CONTAINER_NAME" \
+        "$GENA_CHUNKER_CONTAINER_NAME" \
+        "$RUADAPT_QWEN_SERVER_CONTAINER_NAME"; do
+        [ -n "$c" ] && docker rm -f "$c" >/dev/null 2>&1 || true
+      done
+
+# ---------- DEVELOP ----------
+
+build_services:
+  stage: build
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_DEV"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_DEV"
+  before_script: *in_project_dir
+  script:
+    - echo "Обновляем код в $PROJECT_DIR"
+    - git fetch origin
+    - git reset --hard origin/develop
+    - echo "Генерируем .env-файл на лету"
+    - ./gen_env.sh dev
+    - echo "Собираем Docker-образы"
+    - docker compose -p "$COMPOSE_PROJECT" build
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  tags:
+    - GenA_61
+
+deploy_services:
+  stage: deploy
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_DEV"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_DEV"
+  before_script: *in_project_dir
+  script:
+    - echo "Запускаем контейнеры через docker compose"
+    - docker compose -p "$COMPOSE_PROJECT" down --remove-orphans
+    - !reference [.cleanup_named_containers, script]
+    - docker compose -p "$COMPOSE_PROJECT" up -d
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  tags:
+    - GenA_61
+
+test_smoke_endpoints:
+  stage: test
+  needs:
+    - job: deploy_services
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_DEV"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_DEV"
+  before_script: *in_project_dir
+  script:
+    - bash "$CI_PROJECT_DIR/scripts/ci_smoke_endpoints.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  tags:
+    - GenA_61
+
+test_chunker:
+  stage: test
+  needs:
+    - job: test_smoke_endpoints
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_DEV"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_DEV"
+  before_script: *in_project_dir
+  script:
+    - bash "$CI_PROJECT_DIR/scripts/ci_test_chunker.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  tags:
+    - GenA_61
+
+test_integration_pipeline:
+  stage: test
+  needs:
+    - job: test_chunker
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_DEV"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_DEV"
+  before_script: *in_project_dir
+  script:
+    - bash "$CI_PROJECT_DIR/scripts/ci_integration_test.sh"
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+  tags:
+    - GenA_61
+
+# ---------- MAIN (demo) ----------
+
+build_services_main:
+  stage: build
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_MAIN"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_MAIN"
+  before_script: *in_project_dir
+  script:
+    - echo "Обновляем код в $PROJECT_DIR"
+    - git fetch origin
+    - git reset --hard origin/main
+    - echo "Генерируем .env-файл (prod/demo) на лету"
+    - ./gen_env.sh prod
+    - echo "Собираем Docker-образы"
+    - docker compose -p "$COMPOSE_PROJECT" build
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  tags:
+    - GenA_61
+
+deploy_services_main:
+  stage: deploy
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_MAIN"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_MAIN"
+  before_script: *in_project_dir
+  script:
+    - docker compose -p "$COMPOSE_PROJECT" down --remove-orphans
+    - !reference [.cleanup_named_containers, script]
+    - docker compose -p "$COMPOSE_PROJECT" up -d
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  tags:
+    - GenA_61
+
+test_smoke_endpoints_main:
+  stage: test
+  needs:
+    - job: deploy_services_main
+  variables:
+    PROJECT_DIR: "$PROJECT_DIR_MAIN"
+    COMPOSE_PROJECT: "$COMPOSE_PROJECT_MAIN"
+  before_script: *in_project_dir
+  script:
+    - bash "$CI_PROJECT_DIR/scripts/ci_smoke_endpoints.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  tags:
+    - GenA_61

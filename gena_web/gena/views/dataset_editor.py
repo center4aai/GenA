@@ -1,0 +1,1224 @@
+import streamlit as st
+from gena.http import get, post, put, delete
+from gena.views import page_subtitle
+st.session_state["role"] = "expert"
+is_expert = True
+import pandas as pd
+from datetime import datetime
+from gena.config import API_DATASET_URL
+from gena.validation_display import (
+    format_retry_line,
+    format_validation_breakdown_md,
+    parse_validation_details,
+    parse_validation_justifications,
+)
+import plotly.express as px
+from collections import Counter
+import re
+
+def _parse_validation_score(score_str):
+    """'16.0/16.0' -> (16.0, 16.0); '17/17' -> (17.0, 17.0); иначе -> (None, None)"""
+    try:
+        if not score_str:
+            return None, None
+        parts = str(score_str).split("/")
+        if len(parts) != 2:
+            return None, None
+        return float(parts[0]), float(parts[1])
+    except Exception:
+        return None, None
+
+def _to_bool(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("true", "passed", "yes", "1"):
+            return True
+        if v in ("false", "failed", "no", "0"):
+            return False
+    return None
+
+def _is_passed(q):
+    """
+    Определяем passed: сначала по validation_passed,
+    иначе по total >= threshold, если оба есть.
+    """
+    vp = _to_bool(q.get("validation_passed"))
+    if vp is not None:
+        return vp
+    total, _max_total = _parse_validation_score(q.get("validation_score"))
+    try:
+        thr = float(q.get("validation_threshold")) if q.get("validation_threshold") not in (None, "N/A", "") else None
+    except Exception:
+        thr = None
+    if total is not None and thr is not None:
+        return total >= thr
+    return None
+
+def _norm_options(opts):
+    """Единый вид options для сравнения и вывода"""
+    if isinstance(opts, dict):
+        parts = [f"{k}: {v}" for k, v in sorted(opts.items()) if v and v != "None"]
+        return "\n".join(parts)
+    return str(opts or "")
+
+def _as_options_text(opts):
+    """Привести options к человекочитаемому тексту (для сравнения/редактирования)."""
+    if isinstance(opts, dict):
+        parts = [f"{k}: {v}" for k, v in sorted(opts.items()) if v and v != "None"]
+        return "\n".join(parts)
+    return str(opts or "")
+
+def _parse_options_text(text):
+    """
+    Обратная операция: 'k1: v1\\nk2: v2' -> dict.
+    Пустые/кривые строки пропускаем осторожно.
+    """
+    result = {}
+    if not text:
+        return result
+    for line in str(text).splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k:
+                result[k] = v
+    return result
+
+def _coerce_options_like(original_options, edited):
+    """
+    Привести edited options к типу, как в оригинале.
+    - Если original dict: парсим текст -> dict (или оставляем dict, если уже dict)
+    - Иначе: строка
+    """
+    if isinstance(original_options, dict):
+        if isinstance(edited, dict):
+            return edited
+        return _parse_options_text(edited)
+    return str(edited or "")
+
+def _qid_key(dataset_id):
+    return f"qid_map::{dataset_id}"
+
+def _ensure_qid_map(dataset_id, n):
+    """
+    Локальная карта стабильных ID по индексам: {idx: 'datasetId:00001'}.
+    Храним в session_state, чтобы можно было «присвоить» ID и старым версиям,
+    где их не было, и сравнивать корректно.
+    """
+    key = _qid_key(dataset_id)
+    if key not in st.session_state:
+        st.session_state[key] = {}
+    mp = st.session_state[key]
+    for idx in range(n):
+        if idx not in mp:
+            mp[idx] = f"{dataset_id}:{idx:05d}"
+    return mp
+
+def _inject_qids_local(dataset_id, questions):
+    """
+    Вписать question_id в локальные вопросы, если его нет.
+    Берём из локальной qid-карты по индексу.
+    """
+    qid_map = _ensure_qid_map(dataset_id, len(questions))
+    for idx, q in enumerate(questions):
+        if not q.get("question_id"):
+            q["question_id"] = qid_map.get(idx) or f"{dataset_id}:{idx:05d}"
+
+def _carry_qids_for_save(dataset_id, updated_questions, original_questions):
+    """
+    Перед сохранением: гарантируем, что у каждого вопроса есть устойчивый question_id.
+    Если в original он был — копируем; если нет — берём из локальной qid-карты.
+    """
+    qid_map = _ensure_qid_map(dataset_id, max(len(updated_questions), len(original_questions)))
+    for idx, uq in enumerate(updated_questions):
+        qid = None
+        if idx < len(original_questions):
+            qid = original_questions[idx].get("question_id")
+        if not qid:
+            qid = qid_map.get(idx) or f"{dataset_id}:{idx:05d}"
+        uq["question_id"] = qid
+
+def _norm_question_for_diff(q):
+    return {
+        "question_type": q.get("question_type", ""),
+        "task": q.get("task", ""),
+        "options": _norm_options(q.get("options")),
+        "correct_answer": str(q.get("correct_answer", "")),
+        "provocativeness": str(q.get("provocativeness", "")),
+        "difficulty": str(q.get("difficulty", "")),
+        "validation_score": str(q.get("validation_score", "")),
+        "validation_passed": str(q.get("validation_passed", "")),
+    }
+
+def _compare_questions(q1, q2):
+    """
+    Сравнить 2 вопроса (нормализованные dict'ы).
+    Вернуть словарь {field: (v1, v2)} только для отличающихся полей.
+    """
+    diffs = {}
+    keys = ["question_type", "task", "options", "correct_answer", "provocativeness", "difficulty"]
+    for k in keys:
+        if (q1.get(k) or "") != (q2.get(k) or ""):
+            diffs[k] = (q1.get(k, ""), q2.get(k, ""))
+    return diffs
+
+def _diff_versions(ds1, ds2):
+    """
+    Сравнение по стабильному question_id.
+    Если в одной из версий нет question_id — фоллбэк к сравнению по индексу.
+    """
+    q1 = ds1.get("questions", []) or []
+    q2 = ds2.get("questions", []) or []
+
+    has_ids_1 = any(q.get("question_id") for q in q1)
+    has_ids_2 = any(q.get("question_id") for q in q2)
+
+    diffs = []
+
+    if has_ids_1 and has_ids_2:
+        map1 = {str(q.get("question_id")): i for i, q in enumerate(q1) if q.get("question_id")}
+        map2 = {str(q.get("question_id")): i for i, q in enumerate(q2) if q.get("question_id")}
+        all_ids = sorted(set(map1.keys()) | set(map2.keys()))
+        for qid in all_ids:
+            i = map1.get(qid)
+            j = map2.get(qid)
+            q1n = _norm_question_for_diff(q1[i]) if i is not None else {}
+            q2n = _norm_question_for_diff(q2[j]) if j is not None else {}
+            d = _compare_questions(q1n, q2n)
+            if d:
+                diffs.append({
+                    "qid": qid,
+                    "diffs": d,
+                    "meta": {"v1_idx": i, "v2_idx": j}
+                })
+    else:
+        n = max(len(q1), len(q2))
+        for idx in range(n):
+            a = q1[idx] if idx < len(q1) else {}
+            b = q2[idx] if idx < len(q2) else {}
+            q1n = _norm_question_for_diff(a)
+            q2n = _norm_question_for_diff(b)
+            d = _compare_questions(q1n, q2n)
+            if d:
+                diffs.append({
+                    "qid": f"idx:{idx}",
+                    "diffs": d,
+                    "meta": {
+                        "v1_idx": idx if idx < len(q1) else None,
+                        "v2_idx": idx if idx < len(q2) else None
+                    }
+                })
+    return diffs
+
+def _ensure_edit_cache():
+    if "edits" not in st.session_state:
+        st.session_state.edits = {}
+
+def _reset_question_widgets():
+    """
+    Чистим ВСЕ поля виджетов вопросов,
+    чтобы при смене датасета/версии/страницы не подтягивались старые значения.
+    """
+    pat = re.compile(r'(^|.*::)(type|prov|task|options|answer|diff)_\d+$')
+    for k in list(st.session_state.keys()):
+        if pat.match(k):
+            del st.session_state[k]
+
+def _k(ctx: str, name: str, i_abs: int) -> str:
+    """Единый способ формировать ключи виджетов, завязанных на контекст (dataset_id:version)."""
+    return f"{ctx}::{name}_{i_abs}"
+
+def _save_current_page_draft(ctx, page_questions, start):
+    """
+    Сохраняем в черновик только вопросы, где поля реально отличаются от базы.
+    Если изменений нет — соответствующую запись из черновика удаляем.
+    """
+    _ensure_edit_cache()
+    for i, q in enumerate(page_questions, start=start + 1):  # i = 1-based индекс в UI
+        idx = i - 1  # 0-based индекс в массиве questions
+
+        # Базовые значения из оригинала
+        base_qtype = q.get("question_type", "")
+        base_prov  = str(q.get("provocativeness", ""))
+        base_task  = q.get("task", "") or ""
+        base_opts  = _as_options_text(q.get("options"))
+        base_ans   = str(q.get("correct_answer", ""))
+        base_diff  = str(q.get("difficulty", "") or "")
+
+        cur_qtype = st.session_state.get(_k(ctx, "type", i), base_qtype)
+        cur_prov  = str(st.session_state.get(_k(ctx, "prov", i), base_prov))
+        cur_task  = st.session_state.get(_k(ctx, "task", i), base_task)
+        cur_opts_text = st.session_state.get(_k(ctx, "options", i), base_opts)
+        cur_ans   = str(st.session_state.get(_k(ctx, "answer", i), base_ans))
+        cur_diff  = str(st.session_state.get(_k(ctx, "diff", i), base_diff))
+
+        # Нормализованное сравнение
+        changed = (
+            str(cur_qtype) != str(base_qtype) or
+            str(cur_prov)  != str(base_prov)  or
+            str(cur_task)  != str(base_task)  or
+            str(cur_ans)   != str(base_ans)   or
+            str(cur_opts_text) != str(base_opts) or
+            str(cur_diff)  != str(base_diff)
+        )
+
+        if changed:
+            edited = {
+                "question_id": q.get("question_id"),
+                "chunk_id": q.get("chunk_id"),
+                "question_type": cur_qtype,
+                "task": cur_task,
+                "options": _coerce_options_like(q.get("options"), cur_opts_text),
+                "correct_answer": cur_ans,
+                "provocativeness": cur_prov,
+                "difficulty": (None if cur_diff in ("", "—") else cur_diff),
+            }
+            for k in ("validation_passed", "validation_score", "validation_threshold",
+                      "validation_details", "validation_justifications", "retry_count", "source_chunk"):
+                if q.get(k) is not None:
+                    edited[k] = q[k]
+            st.session_state.edits[idx] = edited
+        else:
+            if idx in st.session_state.edits:
+                del st.session_state.edits[idx]
+
+def _apply_cache_defaults(ctx, i_abs, q):
+    """
+    Перед рендером виджетов запишем в session_state значения из кэша,
+    чтобы при возврате на страницу поля заполнялись последними черновиками.
+    """
+    _ensure_edit_cache()
+    idx = i_abs - 1
+    cached = st.session_state.edits.get(idx)
+    if not cached:
+        return
+    st.session_state.setdefault(_k(ctx, "type", i_abs), cached.get("question_type", q.get("question_type", "open")))
+    st.session_state.setdefault(_k(ctx, "prov", i_abs), str(cached.get("provocativeness", q.get("provocativeness", "2"))))
+    st.session_state.setdefault(_k(ctx, "task", i_abs), cached.get("task", q.get("task", "")))
+    if isinstance(cached.get("options"), dict):
+        opts_text = ""
+        for k, v in cached["options"].items():
+            if v and v != "None":
+                opts_text += f"{k}: {v}\n"
+    else:
+        opts_text = str(cached.get("options", "") or "")
+    st.session_state.setdefault(_k(ctx, "options", i_abs), opts_text)
+    st.session_state.setdefault(_k(ctx, "answer", i_abs), str(cached.get("correct_answer", q.get("correct_answer", ""))))
+    st.session_state.setdefault(_k(ctx, "diff", i_abs), str(cached.get("difficulty", q.get("difficulty", "")) or ""))
+
+# ---------- Extended XLSX export (Chunker + Generation + Validator metadata) ----------
+
+# Максимальные баллы валидатора по типам вопроса (синхронизировано с
+# agent_api/agent/nodes/llm_validator/validator.py: MAX_POINTS).
+_VALIDATION_MAX_POINTS = {
+    "open": 16.0,
+    "one": 20.5,
+    "multi": 20.5,
+}
+
+
+def _gate_score(value):
+    """Приводит [0]/[1]/0/1/'1' к int 0/1; иначе None."""
+    if isinstance(value, list) and value:
+        value = value[0]
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        try:
+            return 1 if int(value) == 1 else 0
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if s in ("1", "true", "True"):
+            return 1
+        if s in ("0", "false", "False"):
+            return 0
+    return None
+
+
+def _index_chunks_by_id(chunks):
+    """
+    Индексирует чанки для связи с вопросами.
+    Ключ — chunk_index (1-based), как сохраняется в задачах генератора.
+    """
+    by_id = {}
+    for c in chunks or []:
+        idx = c.get("chunk_index")
+        if idx is None:
+            continue
+        by_id[idx] = c
+        try:
+            by_id[int(idx)] = c
+        except (TypeError, ValueError):
+            pass
+    return by_id
+
+
+def _gate_columns_for_chunk(chunk):
+    """Возвращает значения шести gate-столбцов для одного чанка."""
+    if not chunk:
+        return {
+            "gate_passed": None,
+            "gate_rejection_reason": None,
+            "c1_chunk_informative": None,
+            "c2_chunk_reference_clarity": None,
+            "c3_chunk_multi_suitability": None,
+            "c1_confidence": None,
+            "c2_confidence": None,
+            "c3_confidence": None,
+            "c1_reasoning": None,
+            "c2_reasoning": None,
+            "c3_reasoning": None,
+            "gate_confidence": None,
+            "gate_justifications": None,
+        }
+
+    gate_result = chunk.get("gate_result") or {}
+    gate_passed_raw = chunk.get("gate_passed")
+    if gate_passed_raw is None:
+        gate_passed_raw = gate_result.get("passed")
+    gate_passed = _gate_score(gate_passed_raw)
+
+    c1 = _gate_score(gate_result.get("c1_chunk_informative"))
+    c2 = _gate_score(gate_result.get("c2_chunk_reference_clarity"))
+    c3 = _gate_score(gate_result.get("c3_chunk_multi_suitability"))
+
+    confidence = {
+        "c1_chunk_informative": gate_result.get("c1_confidence"),
+        "c2_chunk_reference_clarity": gate_result.get("c2_confidence"),
+        "c3_chunk_multi_suitability": gate_result.get("c3_confidence"),
+    }
+    justifications = {
+        "c1_chunk_informative": gate_result.get("c1_reasoning"),
+        "c2_chunk_reference_clarity": gate_result.get("c2_reasoning"),
+        "c3_chunk_multi_suitability": gate_result.get("c3_reasoning"),
+    }
+
+    return {
+        "gate_passed": gate_passed,
+        "gate_rejection_reason": gate_result.get("rejection_reason"),
+        "c1_chunk_informative": c1,
+        "c2_chunk_reference_clarity": c2,
+        "c3_chunk_multi_suitability": c3,
+        "c1_confidence": gate_result.get("c1_confidence"),
+        "c2_confidence": gate_result.get("c2_confidence"),
+        "c3_confidence": gate_result.get("c3_confidence"),
+        "c1_reasoning": gate_result.get("c1_reasoning"),
+        "c2_reasoning": gate_result.get("c2_reasoning"),
+        "c3_reasoning": gate_result.get("c3_reasoning"),
+        "gate_confidence": confidence,
+        "gate_justifications": justifications,
+    }
+
+
+def _validation_score_pair(q):
+    """Возвращает (score, max) из validation_score; max — по типу, если в строке нет."""
+    score, max_total = _parse_validation_score(q.get("validation_score"))
+    if max_total is None:
+        qtype = (q.get("question_type") or "").strip().lower()
+        max_total = _VALIDATION_MAX_POINTS.get(qtype)
+    return score, max_total
+
+
+# Точный порядок столбцов расширенного шаблона "All Pipeline".
+_EXTENDED_EXPORT_COLUMNS = [
+    "chunk_id",
+    "gate_passed",
+    "gate_rejection_reason",
+    "c1_chunk_informative",
+    "c2_chunk_reference_clarity",
+    "c3_chunk_multi_suitability",
+    "c1_confidence",
+    "c2_confidence",
+    "c3_confidence",
+    "c1_reasoning",
+    "c2_reasoning",
+    "c3_reasoning",
+    "gate_confidence",
+    "gate_justifications",
+    "question_id",
+    "question_type",
+    "task",
+    "options",
+    "correct_answer",
+    "sensitivity_level",
+    "difficulty_level",
+    "validation_passed",
+    "validation_score",
+    "validation_threshold",
+    "validation_max",
+    "validation_details",
+    "validation_justifications",
+    "retry_count",
+    "source_chunk",
+]
+
+
+def _build_extended_export_df(questions, chunks):
+    """
+    Строит DataFrame по расширенному шаблону:
+    chunker gate-метаданные + генерация + метаданные валидатора.
+    Каждая строка — один вопрос; чанки без вопросов — отдельной строкой.
+    """
+    chunks_by_id = _index_chunks_by_id(chunks)
+    rows = []
+    seen_chunk_ids = set()
+
+    for q in questions or []:
+        chunk_id = q.get("chunk_id")
+        if chunk_id is not None:
+            seen_chunk_ids.add(chunk_id)
+            try:
+                seen_chunk_ids.add(int(chunk_id))
+            except (TypeError, ValueError):
+                pass
+
+        chunk = chunks_by_id.get(chunk_id)
+        if chunk is None and chunk_id is not None:
+            try:
+                chunk = chunks_by_id.get(int(chunk_id))
+            except (TypeError, ValueError):
+                chunk = None
+
+        gate_cols = _gate_columns_for_chunk(chunk)
+        score, max_total = _validation_score_pair(q)
+
+        rows.append({
+            "chunk_id": chunk_id,
+            **gate_cols,
+            "question_id": q.get("question_id"),
+            "question_type": q.get("question_type"),
+            "task": q.get("task"),
+            "options": _norm_options(q.get("options")),
+            "correct_answer": q.get("correct_answer"),
+            "sensitivity_level": q.get("sensitivity_level") or q.get("provocativeness"),
+            "difficulty_level": q.get("difficulty_level") or q.get("difficulty"),
+            "validation_passed": q.get("validation_passed"),
+            "validation_score": score if score is not None else q.get("validation_score"),
+            "validation_threshold": q.get("validation_threshold"),
+            "validation_max": max_total,
+            "validation_details": q.get("validation_details"),
+            "validation_justifications": q.get("validation_justifications"),
+            "retry_count": q.get("retry_count"),
+            "source_chunk": q.get("source_chunk")
+                or (chunk.get("chunk_text") if chunk else None),
+        })
+
+    # Чанки без сгенерированных вопросов (например, отклонённые gate'ом) —
+    # добавляем строкой с заполненными gate-столбцами и пустыми question-полями.
+    for cid, chunk in chunks_by_id.items():
+        if cid in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(cid)
+        gate_cols = _gate_columns_for_chunk(chunk)
+        rows.append({
+            "chunk_id": chunk.get("chunk_index"),
+            **gate_cols,
+            "question_id": None,
+            "question_type": None,
+            "task": None,
+            "options": None,
+            "correct_answer": None,
+            "sensitivity_level": None,
+            "difficulty_level": None,
+            "validation_passed": None,
+            "validation_score": None,
+            "validation_threshold": None,
+            "validation_max": None,
+            "validation_details": None,
+            "validation_justifications": None,
+            "retry_count": None,
+            "source_chunk": chunk.get("chunk_text"),
+        })
+
+    df = pd.DataFrame(rows, columns=_EXTENDED_EXPORT_COLUMNS)
+
+    # Сортировка по chunk_id (числовая, если возможно), затем по question_id для стабильности.
+    def _chunk_sort_key(v):
+        try:
+            return (0, int(v))
+        except (TypeError, ValueError):
+            return (1, str(v) if v is not None else "")
+
+    df = df.sort_values(
+        by=["chunk_id", "question_id"],
+        key=lambda col: col.map(_chunk_sort_key) if col.name == "chunk_id" else col,
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    return df
+
+
+def _df_to_xlsx_bytes(df, sheet_name="pipeline"):
+    """Сериализует DataFrame в XLSX-байты. dict-ячейки приводит к строкам."""
+    import io
+    import json as _json
+
+    df_for_excel = df.copy()
+    for col in df_for_excel.columns:
+        df_for_excel[col] = df_for_excel[col].map(
+            lambda v: _json.dumps(v, ensure_ascii=False)
+            if isinstance(v, (dict, list))
+            else v
+        )
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_for_excel.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buf.getvalue()
+
+
+# ---------- UI ----------
+st.title("Results & Editor")
+st.markdown("<a name='top'></a>", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown("**On this page**")
+    st.markdown(
+        """
+- [Available Datasets](#available-datasets)
+- [Questions](#questions)
+- [Export](#export)
+        """
+    )
+
+page_subtitle("Browse generated questions, edit inline, compare versions, and export XLSX.")
+st.caption(
+    "You can edit the question by modifying the Task, Options, and other fields, "
+    "then save your changes by clicking \"Save Changes as New Version\" at the "
+    "bottom of the task list."
+)
+st.markdown(
+    """
+- [Available Datasets](#available-datasets)
+- [Questions](#questions)
+- [Export](#export)
+"""
+)
+st.markdown("---")
+
+def load_datasets():
+    try:
+        resp = get("/datasets/")
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 401:
+            st.error("⛔ Unauthorized (401). Please login again.")
+            return []
+        else:
+            st.error(f"Error loading datasets: {resp.status_code}")
+            return []
+    except Exception as e:
+        st.error(f"⛔ Could not connect to the Dataset API server: {e}")
+        return []
+
+def load_dataset(dataset_id, version=None):
+    try:
+        params = {"version": version} if version is not None else None
+        resp = get(f"/datasets/{dataset_id}", params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 401:
+            st.error("⛔ Unauthorized (401). Please login again.")
+            return None
+        else:
+            st.error(f"Error loading dataset: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None
+
+def load_dataset_versions(dataset_id):
+    try:
+        resp = get(f"/datasets/{dataset_id}/versions")
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 401:
+            st.error("⛔ Unauthorized (401). Please login again.")
+            return []
+        else:
+            st.error(f"Error loading versions: {resp.status_code}")
+            return []
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return []
+
+def load_dataset_chunks(dataset_id):
+    """Загружает чанки датасета вместе с gate-валидацией (включая отклонённые)."""
+    try:
+        resp = get(f"/datasets/{dataset_id}/chunks", params={"gate_passed_only": False})
+        if resp.status_code == 200:
+            return resp.json() or []
+        elif resp.status_code == 401:
+            st.error("⛔ Unauthorized (401). Please login again.")
+            return []
+        elif resp.status_code == 404:
+            return []
+        else:
+            st.warning(f"Could not load chunks for dataset (status {resp.status_code})")
+            return []
+    except Exception as e:
+        st.warning(f"Could not load chunks for dataset: {e}")
+        return []
+
+
+def update_dataset(dataset_id, questions_data, metadata=None):
+    try:
+        payload = {
+            "questions": questions_data,
+            "metadata": metadata or {}
+        }
+        resp = put(f"/datasets/{dataset_id}", json=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 401:
+            st.error("⛔ Unauthorized (401). Please login again.")
+            return None
+        else:
+            st.error(f"Error updating dataset: {resp.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None
+
+st.markdown('<a name="available-datasets"></a>', unsafe_allow_html=True)
+st.markdown("### 📊 Available Datasets")
+
+datasets = load_datasets()
+
+if not datasets:
+    st.info("No datasets found. Generate some datasets first using Data Preprocessing.")
+else:
+    def _short(x):
+        return str(x)[:8] if x else "?"
+
+    datasets_sorted = sorted(datasets, key=lambda d: d.get("created_at", ""), reverse=True)
+    by_id = {d["_id"]: d for d in datasets_sorted}
+    ids = list(by_id.keys())
+
+    default_id = st.session_state.get("selected_dataset_id", ids[0] if ids else None)
+    default_index = ids.index(default_id) if default_id in ids else 0
+
+    selected_dataset_id = st.selectbox(
+        "Select a dataset:",
+        options=ids,
+        index=default_index,
+        format_func=lambda ds_id: f"{by_id[ds_id]['name']} (v{by_id[ds_id].get('current_version','?')}) — {_short(ds_id)}",
+        key="dataset_selector_id",
+    )
+
+    st.session_state["selected_dataset_id"] = selected_dataset_id
+    selected_ds = by_id[selected_dataset_id]
+    if selected_ds:
+        selected_dataset_id = selected_ds["_id"]
+
+        versions = load_dataset_versions(selected_dataset_id)
+
+        if versions:
+            version_options = {f"Version {v['version']} ({v['created_at'][:10]})": v['version'] for v in versions}
+            selected_version_name = st.selectbox(
+                "Select version:",
+                list(version_options.keys()),
+                key=f"version_selector::{selected_dataset_id}"
+            )
+            selected_version = version_options[selected_version_name]
+
+            _ctx = f"{selected_dataset_id}:{selected_version}"
+            _prev = st.session_state.get("page_ctx")
+            if _prev != _ctx:
+                st.session_state.page = 1
+                st.session_state.page_ctx = _ctx
+                st.session_state.pop("edits", None)
+                _reset_question_widgets()
+                st.rerun()
+
+            # Загружаем выбранную версию
+            dataset = load_dataset(selected_dataset_id, selected_version)
+
+            if dataset:
+                _inject_qids_local(selected_dataset_id, dataset.get("questions", []) or [])
+
+                st.markdown("---")
+                st.markdown(f"### 📋 Dataset: {dataset['name']}")
+                st.markdown(f"**Description:** {dataset.get('description', 'No description')}")
+                st.markdown(f"**Source Document:** {dataset['source_document']}")
+                st.markdown(f"**Current Version:** {dataset['current_version']}")
+                st.markdown(f"**Viewing Version:** {dataset['requested_version']}")
+                st.markdown(f"**Created:** {dataset['created_at'][:19]}")
+                st.markdown(f"**Updated:** {dataset['updated_at'][:19]}")
+
+                #  Question number + Avg validation rate
+                questions = dataset.get("questions", [])
+                total_questions = len(questions)
+
+                passed_flags = []
+                for q in questions:
+                    pv = _is_passed(q)
+                    if pv is not None:
+                        passed_flags.append(pv)
+
+                if passed_flags:
+                    avg_validation_rate = (sum(1 for x in passed_flags if x) / len(passed_flags)) * 100
+                    rate_str = f"{avg_validation_rate:.1f}%"
+                else:
+                    rate_str = "—"
+
+                st.markdown("### 📈 Dataset statistics")
+                k1, k2 = st.columns(2)
+                with k1:
+                    st.metric("Question number", total_questions)
+                with k2:
+                    st.metric("Avg validation rate", rate_str)
+
+                st.markdown("---")
+                st.markdown("### 📊 Distributions")
+                c1, c2, c3 = st.columns(3)
+
+                #  Типы вопросов
+                with c1:
+                    if questions:
+                        s = pd.Series([q.get("question_type", "—") for q in questions]).value_counts()
+                        if not s.empty:
+                            df_types = s.rename_axis("type").reset_index(name="count")
+                            fig = px.bar(df_types, x="type", y="count", title="By Question Type", text="count")
+                            fig.update_layout(xaxis_title=None, yaxis_title=None)
+                            fig.update_traces(marker_line_width=1, marker_line_color="white")
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No data for question types")
+                    else:
+                        st.info("No questions")
+
+                # Провокативность (чувствительность)
+                with c2:
+                    if questions:
+                        prov_vals = []
+                        for q in questions:
+                            v = str(q.get("provocativeness", "")).strip()
+                            if v in ("1", "2", "3"):
+                                prov_vals.append(int(v))
+                        if prov_vals:
+                            counts = pd.Series(prov_vals).value_counts().reindex([1, 2, 3], fill_value=0)
+                            df_prov = counts.rename_axis("provocativeness").reset_index(name="count")
+                            fig = px.bar(df_prov, x="provocativeness", y="count", title="By Provocativeness", text="count")
+                            fig.update_layout(xaxis=dict(type="category", categoryorder="array", categoryarray=[1,2,3]),
+                                              yaxis_title=None, xaxis_title=None)
+                            fig.update_traces(marker_line_width=1, marker_line_color="white")
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No data for provocativeness")
+                    else:
+                        st.info("No questions")
+
+                # Validation total score
+                with c3:
+                    scores = []
+                    for q in questions:
+                        total, _max_ = _parse_validation_score(q.get("validation_score"))
+                        if total is not None:
+                            scores.append(int(total))
+                    if scores:
+                        mn, mx = min(scores), max(scores)
+                        all_vals = list(range(mn, mx + 1))
+                        cnt = Counter(scores)
+                        df_scores = pd.DataFrame({"score": all_vals, "count": [cnt.get(v, 0) for v in all_vals]})
+                        fig = px.bar(df_scores, x="score", y="count", title="By Validation Total Score", text="count")
+                        fig.update_layout(xaxis_title="total", yaxis_title="count", xaxis=dict(tickmode="linear", dtick=1))
+                        fig.update_traces(marker_line_width=1, marker_line_color="white")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No validation scores to plot")
+
+                # ---------- Questions ----------
+                st.markdown("---")
+                st.markdown('<a name="questions"></a>', unsafe_allow_html=True)
+                st.markdown("### ❓ Questions")
+
+                page_size = 10
+                total_questions = len(questions)
+                num_pages = (total_questions - 1) // page_size + 1 if total_questions > 0 else 1
+
+                if "page" not in st.session_state:
+                    st.session_state.page = 1
+                st.session_state.page = max(1, min(st.session_state.page, num_pages))
+
+                st.session_state.page = st.number_input(
+                    "Page",
+                    min_value=1, max_value=num_pages, value=st.session_state.page, step=1,
+                    key=f"page_selector::{_ctx}"
+                )
+
+                start = (st.session_state.page - 1) * page_size
+                end = start + page_size
+                page_questions = questions[start:end]
+
+                # --- вывод вопросов ---
+                if is_expert:
+                    with st.form(f"edit_questions::{_ctx}::page_{st.session_state.page}"):
+                        edited_questions = []
+                        for i, question in enumerate(page_questions, start=start + 1):
+                            _apply_cache_defaults(_ctx, i, question)
+
+                            st.markdown(f"#### Question {i} (Chunk {question.get('chunk_id','—')})")
+
+                            if question.get('source_chunk'):
+                                with st.expander("📄 View Source Text", expanded=False):
+                                    st.markdown("**Source Text:**")
+                                    st.code(question['source_chunk'], language=None)
+
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                qtype_list = ['one', 'multi', 'open']
+                                qtype_val = st.session_state.get(_k(_ctx, "type", i), question.get('question_type', 'open'))
+                                qtype_idx = qtype_list.index(qtype_val) if qtype_val in qtype_list else 2
+                                question_type = st.selectbox(
+                                    f"Type {i}:",
+                                    qtype_list,
+                                    index=qtype_idx,
+                                    key=_k(_ctx, "type", i),
+                                )
+                            with col2:
+                                prov_list = ['1', '2', '3']
+                                prov_val = str(st.session_state.get(_k(_ctx, "prov", i), str(question.get('provocativeness', '2'))))
+                                prov_idx = prov_list.index(prov_val) if prov_val in prov_list else 1
+                                provocativeness = st.selectbox(
+                                    f"Provocativeness {i}:",
+                                    prov_list,
+                                    index=prov_idx,
+                                    key=_k(_ctx, "prov", i),
+                                )
+
+                                diff_list = ['—', '1', '2', '3']
+                                raw_diff = str(st.session_state.get(_k(_ctx, "diff", i), str(question.get('difficulty', '') or ''))).strip()
+                                diff_idx = diff_list.index(raw_diff) if raw_diff in diff_list else 0
+                                difficulty_choice = st.selectbox(
+                                    f"Difficulty level {i}:",
+                                    diff_list,
+                                    index=diff_idx,
+                                    key=_k(_ctx, "diff", i),
+                                )
+                                difficulty_to_save = None if difficulty_choice == '—' else difficulty_choice
+
+                            task = st.text_area(
+                                f"Task {i}:",
+                                value=st.session_state.get(_k(_ctx, "task", i), question.get('task', '')),
+                                height=100,
+                                key=_k(_ctx, "task", i),
+                            )
+
+                            # options -> в текст (key: value)
+                            options_value = st.session_state.get(_k(_ctx, "options", i))
+                            if options_value is None:
+                                ov = question.get('options', '')
+                                if isinstance(ov, dict):
+                                    options_text = ""
+                                    for k, v in ov.items():
+                                        if v and v != "None":
+                                            options_text += f"{k}: {v}\n"
+                                else:
+                                    options_text = str(ov or "")
+                            else:
+                                options_text = options_value
+
+                            options = st.text_area(
+                                f"Options {i}:",
+                                value=options_text,
+                                height=80,
+                                key=_k(_ctx, "options", i),
+                            )
+
+                            correct_answer = st.text_area(
+                                f"Correct Answer {i}:",
+                                value=st.session_state.get(_k(_ctx, "answer", i), str(question.get('correct_answer', ''))),
+                                height=60,
+                                key=_k(_ctx, "answer", i),
+                            )
+
+                            if question.get('validation_passed') or question.get('validation_score'):
+                                v1, v2 = st.columns(2)
+                                with v1:
+                                    vp = question.get('validation_passed', 'N/A')
+                                    vp_str = str(vp)
+                                    if vp_str.lower() in ('true', 'passed'):
+                                        st.success("✅ Validation: PASSED")
+                                    elif vp_str.lower() in ('false', 'failed'):
+                                        st.error("❌ Validation: FAILED")
+                                    else:
+                                        st.info(f"ℹ️ Validation: {vp}")
+                                with v2:
+                                    vs = question.get('validation_score', 'N/A')
+                                    vt = question.get('validation_threshold', 'N/A')
+                                    st.info(f"📊 Score: {vs} (Threshold: {vt})")
+
+                                st.markdown(format_retry_line(question.get("retry_count", 0)))
+
+                                if question.get('validation_details'):
+                                    with st.expander("🔍 Validation Details", expanded=False):
+                                        by_block = parse_validation_details(question.get("validation_details"))
+                                        justifications = parse_validation_justifications(
+                                            question.get("validation_justifications")
+                                        )
+                                        st.markdown(
+                                            format_validation_breakdown_md(by_block, justifications)
+                                        )
+
+                            edited_question = {
+                                "question_id": question.get('question_id'),
+                                "chunk_id": question.get('chunk_id'),
+                                "question_type": question_type,
+                                "task": task,
+                                "options": options,
+                                "correct_answer": correct_answer,
+                                "provocativeness": provocativeness,
+                                "difficulty": difficulty_to_save,
+                            }
+                            for k in ("validation_passed", "validation_score", "validation_threshold", "validation_details", "validation_justifications", "retry_count", "source_chunk"):
+                                if question.get(k) is not None:
+                                    edited_question[k] = question[k]
+
+                            edited_questions.append(edited_question)
+                            st.markdown("---")
+
+                        if st.form_submit_button("💾 Save Changes as New Version"):
+                            if edited_questions:
+                                # перед сохранением добавим текущую страницу в черновик
+                                _save_current_page_draft(_ctx, page_questions, start)
+
+                                metadata = dataset.get('metadata', {}) or {}
+                                metadata['edited_at'] = datetime.now().isoformat()
+                                metadata['edited_by'] = st.session_state.get('username', 'expert')
+
+                                updated_questions = []
+                                _ensure_edit_cache()
+
+                                # если есть черновик для индекса — ставим его, иначе оригинал
+                                for idx, q in enumerate(questions):
+                                    if idx in st.session_state.edits:
+                                        updated_questions.append(st.session_state.edits[idx])
+                                    else:
+                                        passthrough = {
+                                            "question_id": q.get('question_id'),
+                                            "chunk_id": q.get('chunk_id'),
+                                            "question_type": q.get('question_type', ''),
+                                            "task": q.get('task', ''),
+                                            "options": q.get('options', ''),
+                                            "correct_answer": q.get('correct_answer', ''),
+                                            "provocativeness": q.get('provocativeness', ''),
+                                            "difficulty": q.get('difficulty', None),
+                                        }
+                                        for k in ("validation_passed", "validation_score", "validation_threshold", "validation_details", "validation_justifications", "retry_count", "source_chunk"):
+                                            if q.get(k) is not None:
+                                                passthrough[k] = q[k]
+                                        updated_questions.append(passthrough)
+
+                                _carry_qids_for_save(selected_dataset_id, updated_questions, questions)
+
+                                result = update_dataset(selected_dataset_id, updated_questions, metadata)
+                                if result:
+                                    st.success(f"✅ Dataset updated successfully! New version: {result['new_version']}")
+                                    # очищаем черновики после успешной публикации
+                                    st.session_state.pop("edits", None)
+                                    st.rerun()
+                            else:
+                                st.warning("No questions to save")
+                else:
+                    st.info("🔒 Read-only: You are logged in as a regular user. Editing is available for experts only.")
+                    for i, question in enumerate(page_questions, start=start + 1):
+                        st.markdown(f"#### Question {i} (Chunk {question.get('chunk_id','—')})")
+                        if question.get('source_chunk'):
+                            with st.expander("📄 View Source Text", expanded=False):
+                                st.markdown("**Source Text:**")
+                                st.code(question['source_chunk'], language=None)
+                        st.write(f"**Type:** {question.get('question_type','—')}")
+                        sens_val = question.get("sensitivity_level") or question.get("provocativeness")
+                        if sens_val not in (None, "", "None"):
+                            st.write(f"**Sensitivity level:** {sens_val}")
+                        diff_val = question.get("difficulty_level") or question.get("difficulty")
+                        if diff_val not in (None, "", "None"):
+                            st.write(f"**Difficulty level:** {diff_val}")
+                        st.write(f"**Task:** {question.get('task','—')}")
+                        st.write(f"**Options:** {_norm_options(question.get('options')) or '—'}")
+                        st.write(f"**Correct Answer:** {question.get('correct_answer','—')}")
+                        if question.get('validation_passed') or question.get('validation_score'):
+                            v1, v2 = st.columns(2)
+                            with v1:
+                                vp = question.get('validation_passed', 'N/A')
+                                st.write(f"Validation: {vp}")
+                            with v2:
+                                vs = question.get('validation_score', 'N/A')
+                                vt = question.get('validation_threshold', 'N/A')
+                                st.write(f"Score: {vs} (Thr: {vt})")
+                            st.markdown(format_retry_line(question.get("retry_count", 0)))
+                            if question.get('validation_details'):
+                                with st.expander("🔍 Validation Details", expanded=False):
+                                    by_block = parse_validation_details(question.get("validation_details"))
+                                    justifications = parse_validation_justifications(
+                                        question.get("validation_justifications")
+                                    )
+                                    st.markdown(
+                                        format_validation_breakdown_md(by_block, justifications)
+                                    )
+                        st.markdown("---")
+
+                # --- Кнопки навигации снизу ---
+                # Виджет st.number_input с этим ключом уже инстанцирован выше (см. ~806).
+                # После инстанциации виджета изменять st.session_state[<widget_key>]
+                # в том же ране запрещено (StreamlitAPIException). Поэтому делаем
+                # переключение страницы через on_click-колбэк: он выполняется в начале
+                # следующего рана ДО рендеринга виджетов, и там присваивать состояние
+                # виджету уже можно.
+                _page_widget_key = f"page_selector::{_ctx}"
+
+                def _go_to_page(
+                    new_page: int,
+                    *,
+                    _ctx=_ctx,
+                    _page_widget_key=_page_widget_key,
+                    _page_questions=page_questions,
+                    _start=start,
+                    _is_expert=is_expert,
+                ):
+                    if _is_expert:
+                        _save_current_page_draft(_ctx, _page_questions, _start)
+                    _reset_question_widgets()
+                    st.session_state.page = new_page
+                    st.session_state[_page_widget_key] = new_page
+
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    if st.session_state.page > 1:
+                        st.button(
+                            "⬅️ Prev",
+                            key=f"prev_btn::{_ctx}",
+                            on_click=_go_to_page,
+                            args=(st.session_state.page - 1,),
+                        )
+                with col2:
+                    _ensure_edit_cache()
+                    edits_count = len(st.session_state.edits)
+                    st.markdown(f"**Page {st.session_state.page}/{num_pages}**  &nbsp;&nbsp; _draft edits: {edits_count}_", unsafe_allow_html=True)
+                with col3:
+                    if st.session_state.page < num_pages:
+                        st.button(
+                            "Next ➡️",
+                            key=f"next_btn::{_ctx}",
+                            on_click=_go_to_page,
+                            args=(st.session_state.page + 1,),
+                        )
+
+                # Ссылка наверх
+                st.markdown("[⬆️ Back to top](#top)")
+
+                st.markdown("---")
+                st.markdown('<a name="export"></a>', unsafe_allow_html=True)
+                st.markdown("### 📥 Export")
+
+                df = pd.DataFrame(questions)
+                df = df.rename(columns={
+                    "provocativeness": "sensitivity_level",
+                    "difficulty": "difficulty_level",
+                })
+
+                # validation_score из БД хранится строкой вида "16.0/16.0".
+                # Разделяем её на два столбца: validation_score (балл данного вопроса)
+                # и validation_max (максимальный балл по вопросу этого типа).
+                # Если max не извлекается из строки — берём из _VALIDATION_MAX_POINTS
+                # по question_type (синхронизировано с extended-экспортом).
+                _score_pairs = [_validation_score_pair(q) for q in questions]
+                df["validation_score"] = [s for s, _m in _score_pairs]
+                df["validation_max"] = [m for _s, m in _score_pairs]
+
+                # chunk_id теперь первый столбец, question_id — второй.
+                # validation_max идёт сразу после validation_threshold.
+                core_order = [
+                    "chunk_id", "question_id", "question_type", "task", "options", "correct_answer",
+                    "sensitivity_level", "difficulty_level",
+                    "validation_passed", "validation_score", "validation_threshold", "validation_max",
+                ]
+                rest_cols = [c for c in df.columns if c not in core_order]
+                final_order = [c for c in core_order if c in df.columns] + rest_cols
+
+                df_export = df[final_order]
+                xlsx_results_bytes = _df_to_xlsx_bytes(df_export, sheet_name="results")
+
+                exp_col1, exp_col2 = st.columns(2)
+                with exp_col1:
+                    st.download_button(
+                        "📥 Download XLSX (includes source text)",
+                        data=xlsx_results_bytes,
+                        file_name=f"{dataset['name']}_v{dataset['requested_version']}.xlsx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        key="dataset_xlsx_results_download",
+                    )
+                    st.caption("For Generation Results")
+
+                with exp_col2:
+                    chunks_full = load_dataset_chunks(selected_dataset_id)
+                    df_extended = _build_extended_export_df(questions, chunks_full)
+                    xlsx_bytes = _df_to_xlsx_bytes(df_extended, sheet_name="pipeline")
+                    st.download_button(
+                        "📥 Download XLSX (full pipeline)",
+                        data=xlsx_bytes,
+                        file_name=f"{dataset['name']}_v{dataset['requested_version']}_pipeline.xlsx",
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        key="dataset_xlsx_download",
+                    )
+                    st.caption(
+                        "For All Pipeline (Chunker Metadata + Generation + Validator Metadata)"
+                    )
+
+                if len(versions) > 1:
+                    st.markdown("---")
+                    st.markdown("### 🔍 Version Comparison (only differences)")
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        version1 = st.selectbox("Version 1:", [v['version'] for v in versions], key="v1")
+                    with col2:
+                        version2 = st.selectbox("Version 2:", [v['version'] for v in versions], key="v2")
+
+                    if version1 != version2:
+                        if st.button("Compare Versions", key="compare_btn"):
+                            dataset1 = load_dataset(selected_dataset_id, version1)
+                            dataset2 = load_dataset(selected_dataset_id, version2)
+
+                            if dataset1 and dataset2:
+                                _inject_qids_local(selected_dataset_id, dataset1.get("questions", []) or [])
+                                _inject_qids_local(selected_dataset_id, dataset2.get("questions", []) or [])
+
+                                st.markdown(f"#### Comparing Version {version1} vs Version {version2}")
+                                st.markdown(f"**Version {version1}:** {len(dataset1.get('questions', []))} questions")
+                                st.markdown(f"**Version {version2}:** {len(dataset2.get('questions', []))} questions")
+
+                                diffs = _diff_versions(dataset1, dataset2)
+                                if not diffs:
+                                    st.success("✅ No differences between selected versions")
+                                else:
+                                    st.info(f"Found {len(diffs)} differing questions")
+                                    for d in diffs:
+                                        qid = d.get("qid")
+                                        meta = d["meta"]
+                                        st.markdown(f"##### • Question id: {qid}  (v{version1} idx={meta.get('v1_idx')}, v{version2} idx={meta.get('v2_idx')})")
+                                        for field, (v1, v2) in d["diffs"].items():
+                                            with st.expander(f"Changed field: {field}", expanded=False):
+                                                c1, c2 = st.columns(2)
+                                                with c1:
+                                                    st.markdown(f"**v{version1}**")
+                                                    st.code(str(v1) if v1 is not None else "—")
+                                                with c2:
+                                                    st.markdown(f"**v{version2}**")
+                                                    st.code(str(v2) if v2 is not None else "—")
+                                st.markdown("---")
+        else:
+            st.error("No versions found for this dataset")
