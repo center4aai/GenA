@@ -60,7 +60,7 @@ GenA’s advantage is its user-friendly web interface—no command-line expertis
 Follow these steps to generate and evaluate legal assessment questions:
 ### 1. Access the Web Interface  
 Open your browser and go to:  
-**http://localhost:27369**
+**https://83.143.66.61:27369**
 
 > 💡 For testing, you can use the sample legal document provided directly in the web interface—no upload required.
 
