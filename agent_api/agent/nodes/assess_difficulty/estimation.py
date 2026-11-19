@@ -1,40 +1,46 @@
-from typing import TypedDict, Optional, Union
-from pydantic import BaseModel, Field
+import logging
+from typing import TypedDict, Optional
+
+from pydantic import BaseModel, Field, ValidationError
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import Runnable
-from langchain_core.output_parsers import JsonOutputParser
 
-from llm_factory import create_chat_llm
+from llm_factory import TRANSIENT_LLM_ERRORS, create_chat_llm
 from agent.nodes.assess_difficulty.prompt_difficulty import DIFFICULTY_PROMPT
+from agent.schemas.question import (
+    StructuredQuestionOutput,
+    serialize_question_options,
+    fence_user_content,
+    format_question_context,
+)
+from agent.llm_parsing import parse_assessment_model
 
-
-class StructuredQuestionOutput(BaseModel):
-    task: str = Field(description="Текст вопроса.")
-    text: Optional[str] = Field(
-        default=None, description="Дополнительный контекст вопроса."
-    )
-    option_1: Optional[str] = Field(default=None, description="Вариант ответа 1.")
-    option_2: Optional[str] = Field(default=None, description="Вариант ответа 2.")
-    option_3: Optional[str] = Field(default=None, description="Вариант ответа 3.")
-    option_4: Optional[str] = Field(default=None, description="Вариант ответа 4.")
-    option_5: Optional[str] = Field(default=None, description="Вариант ответа 5.")
-    option_6: Optional[str] = Field(default=None, description="Вариант ответа 6.")
-    option_7: Optional[str] = Field(default=None, description="Вариант ответа 7.")
-    option_8: Optional[str] = Field(default=None, description="Вариант ответа 8.")
-    option_9: Optional[str] = Field(default=None, description="Вариант ответа 9.")
-    outputs: Union[int, str] = Field(
-        description="Правильный ответ: для типов 'one' - номер варианта (1-9), 'multi' - номера через запятую без пробелов (например, '1,3'), 'open' - текст ответа."
-    )
+logger = logging.getLogger(__name__)
 
 
 class DifficultyInput(TypedDict):
     generated_question: StructuredQuestionOutput
+    source_text: Optional[str]
 
 
 class DifficultyOutput(BaseModel):
-    difficulty: int = Field(ge=1, le=3)
-    explanation: str
+    # None + assessment_failed=True — оценка не состоялась (парсинг, невалидный
+    # вход, нетранзиентная ошибка LLM). Раньше сюда подставлялась «1» и воркер
+    # сохранял её как настоящую оценку.
+    difficulty: Optional[int] = Field(default=None, ge=1, le=3)
+    explanation: Optional[str] = None
+    assessment_failed: bool = False
+    assessment_error: Optional[str] = None
+
+
+def _failed_assessment(error: str) -> DifficultyOutput:
+    return DifficultyOutput(
+        difficulty=None,
+        explanation=None,
+        assessment_failed=True,
+        assessment_error=str(error)[:300],
+    )
 
 
 def create_difficulty_chain(
@@ -53,23 +59,37 @@ def create_difficulty_chain(
         api_key=api_key,
         temperature=0.0,
         max_tokens=256,
-        timeout=90,
         **provider_kwargs,
     )
 
-    parser = JsonOutputParser(pydantic_object=DifficultyOutput)
+    # Используется parse_assessment_model как источник значений по умолчанию:
+    # score None означает «поле отсутствует», а не подставленную оценку.
+    fallback = _failed_assessment("score missing in LLM response")
 
     class DifficultyRunnable(Runnable[DifficultyInput, DifficultyOutput]):
         def invoke(self, input_data: DifficultyInput) -> DifficultyOutput:
-            question_data = input_data["generated_question"]
-            question_data = StructuredQuestionOutput(**question_data)
+            raw_question = input_data["generated_question"]
+            try:
+                if isinstance(raw_question, StructuredQuestionOutput):
+                    question_data = raw_question
+                else:
+                    question_data = StructuredQuestionOutput(**raw_question)
+            except (ValidationError, TypeError, ValueError) as exc:
+                logger.warning("Invalid question payload for difficulty assessment: %s", exc)
+                return _failed_assessment(f"invalid question payload: {exc}")
+
+            source_text = (
+                (input_data.get("source_text") or "").strip()
+                or (question_data.source_text or "").strip()
+            )
+            options_text = serialize_question_options(question_data)
 
             prompt = system_prompt.format(
                 question=question_data.task,
-                context=(
-                    question_data.text
-                    if question_data.text
-                    else "Нет дополнительного контекста"
+                context=format_question_context(question_data.text),
+                options=options_text,
+                source_text=fence_user_content(
+                    source_text or "(не указан)", "SOURCE_TEXT"
                 ),
             )
 
@@ -78,22 +98,27 @@ def create_difficulty_chain(
                 HumanMessage(content="Выполни оценку сложности."),
             ])
 
-            chain = chat_prompt | llm | parser
-            result = chain.invoke({})
-            # JsonOutputParser может вернуть словарь или объект Pydantic модели
-            if isinstance(result, dict):
-                return DifficultyOutput(**result)
-            elif isinstance(result, DifficultyOutput):
-                return result
-            else:
-                # Если результат - это что-то другое, пытаемся преобразовать
-                if hasattr(result, "model_dump"):
-                    return DifficultyOutput(**result.model_dump())
-                elif hasattr(result, "dict"):
-                    return DifficultyOutput(**result.dict())
-                else:
-                    raise ValueError(
-                        f"Unexpected result type: {type(result)}, value: {result}"
-                    )
+            try:
+                response = (chat_prompt | llm).invoke({})
+                raw = response.content if hasattr(response, "content") else str(response)
+            except TRANSIENT_LLM_ERRORS:
+                # Таймаут/503/429/auth — не вердикт по содержанию; пусть долетит
+                # до API и станет 5xx/401, чтобы очередь повторила задачу.
+                raise
+            except Exception as exc:
+                logger.warning("Difficulty assessment LLM call failed: %s", exc)
+                return _failed_assessment(f"llm call failed: {exc}")
+
+            parsed = parse_assessment_model(
+                raw,
+                DifficultyOutput,
+                "difficulty",
+                fallback,
+                score_aliases=("score", "difficulty_level", "level"),
+            )
+            if parsed.difficulty is None:
+                logger.warning("Difficulty assessment returned no usable score")
+                return fallback
+            return parsed
 
     return DifficultyRunnable()

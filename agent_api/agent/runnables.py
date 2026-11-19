@@ -4,18 +4,26 @@ from typing import Dict, Optional
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from agent.nodes.generate_question.generate_question import GenerateQuestionInput, create_generate_question_chain
-from agent.nodes.assess_sensitivity.estimation import ProvocativenessInput, create_provocativeness_chain
+from agent.nodes.assess_sensitivity.estimation import (
+    ProvocativenessInput,
+    ProvocativenessOutput,
+    create_provocativeness_chain,
+)
 from agent.nodes.llm_validator.validation_chain import ValidationInput, ValidationOutput, create_validation_chain
 from agent.nodes.refine_question.refine_question import RefineQuestionInput, create_refine_question_chain
-from agent.nodes.assess_difficulty.estimation import DifficultyInput,DifficultyOutput, create_difficulty_chain
+from agent.nodes.assess_difficulty.estimation import (
+    DifficultyInput,
+    DifficultyOutput,
+    create_difficulty_chain,
+)
 from agent.nodes.chunk_gate.chunk_gate import ChunkGateInput, ChunkGateOutput, create_chunk_gate_chain
 
 @dataclass
 class GENAARunnablesOllama:
     generate_question_chain: Runnable[GenerateQuestionInput, AIMessage]
-    provocativeness_chain: Runnable[ProvocativenessInput, AIMessage]
+    provocativeness_chain: Runnable[ProvocativenessInput, ProvocativenessOutput]
     validation_chain: Runnable[ValidationInput, ValidationOutput]
-    difficulty_chain: Runnable[DifficultyInput,DifficultyOutput]
+    difficulty_chain: Runnable[DifficultyInput, DifficultyOutput]
     refine_question_chain: Runnable[RefineQuestionInput, dict]
     chunk_gate_chain: Runnable[ChunkGateInput, ChunkGateOutput] = None
 
@@ -27,6 +35,8 @@ def _extract_provider_kwargs(model_dict: dict) -> dict:
         result["scope"] = extra["scope"]
     if "folder_id" in extra:
         result["folder_id"] = extra["folder_id"]
+    if "reasoning_effort" in extra:
+        result["reasoning_effort"] = extra["reasoning_effort"]
     return result
 
 

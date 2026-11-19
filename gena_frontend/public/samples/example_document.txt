@@ -1,0 +1,11 @@
+Example Document for GenA
+
+Article 1. General provisions
+
+This example document demonstrates how GenA splits text into passages and generates
+questions. Teachers can upload .docx, .txt or .pdf files with structured content.
+
+Article 2. Rights and duties
+
+Each passage should contain enough information for a meaningful question.
+Prefer documents with clear headings and numbered sections for best results.

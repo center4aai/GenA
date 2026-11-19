@@ -13,6 +13,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { useTranslation } from 'react-i18next';
 
 const PALETTE = ['#3f6b4f', '#c08a3e', '#2f8f83', '#8b5cf6', '#ef4444', '#0ea5e9', '#ec4899'];
 
@@ -23,12 +24,13 @@ interface ChartCardProps {
   isEmpty?: boolean;
 }
 
-function ChartCard({ title, children, emptyLabel = 'No data', isEmpty }: ChartCardProps) {
+function ChartCard({ title, children, emptyLabel, isEmpty }: ChartCardProps) {
+  const { t } = useTranslation('common');
   return (
     <div className="card">
       <h3 className="font-semibold text-slate-900">{title}</h3>
       {isEmpty ? (
-        <p className="mt-3 text-sm text-slate-500">{emptyLabel}</p>
+        <p className="mt-3 text-sm text-slate-500">{emptyLabel ?? t('common:noData')}</p>
       ) : (
         <div className="mt-4 h-64">{children}</div>
       )}
@@ -52,8 +54,9 @@ export function BarChartRc({
   color?: string;
   emptyLabel?: string;
 }) {
+  const allZero = data.length > 0 && data.every((d) => d.value === 0);
   return (
-    <ChartCard title={title} isEmpty={!data.length} emptyLabel={emptyLabel}>
+    <ChartCard title={title} isEmpty={!data.length || allZero} emptyLabel={emptyLabel}>
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} margin={{ top: 8, right: 8, bottom: 8, left: -16 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
@@ -76,8 +79,9 @@ export function PieChartRc({
   data: CategoryDatum[];
   emptyLabel?: string;
 }) {
+  const allZero = data.length > 0 && data.every((d) => d.value === 0);
   return (
-    <ChartCard title={title} isEmpty={!data.length} emptyLabel={emptyLabel}>
+    <ChartCard title={title} isEmpty={!data.length || allZero} emptyLabel={emptyLabel}>
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Pie data={data} dataKey="value" nameKey="label" outerRadius={80} label>
@@ -106,8 +110,9 @@ export function LineChartRc({
   ydomain?: [number, number];
   emptyLabel?: string;
 }) {
+  const allZero = data.length > 0 && data.every((d) => d.value === 0);
   return (
-    <ChartCard title={title} isEmpty={!data.length} emptyLabel={emptyLabel}>
+    <ChartCard title={title} isEmpty={!data.length || allZero} emptyLabel={emptyLabel}>
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={data} margin={{ top: 8, right: 8, bottom: 8, left: -16 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
@@ -132,13 +137,14 @@ export interface ProgressSegment {
  * so it's clear how a queue is moving. Segments are proportional to `value`.
  */
 export function SegmentedProgressBar({ title, segments }: { title?: string; segments: ProgressSegment[] }) {
+  const { t } = useTranslation('common');
   const total = segments.reduce((s, x) => s + x.value, 0);
   return (
     <div>
       {title && (
         <div className="mb-1 flex items-center justify-between text-sm">
           <span className="truncate text-slate-700">{title}</span>
-          <span className="text-slate-400">{total} tasks</span>
+          <span className="text-slate-400">{t('common:tasks', { count: total })}</span>
         </div>
       )}
       <div className="flex h-3 overflow-hidden rounded-full bg-slate-100">

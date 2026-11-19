@@ -1,9 +1,10 @@
-import { getDataset } from '@/shared/api/dataset';
+import { getDataset, listDatasetTasks } from '@/shared/api/dataset';
 import { computeDatasetProgress, isValidationPassed } from '@/shared/lib/progress';
 import { mapWithConcurrency } from '@/shared/lib/async';
-import type { Dataset, Question } from '@/shared/types/documents';
+import type { Dataset, Question, Task } from '@/shared/types/documents';
 
 export interface DsStatRow {
+  id: string;
   name: string;
   status: string;
   progress: number;
@@ -21,7 +22,7 @@ export interface StatisticsData {
 
 /** Stable query key so the page and the background prefetch share one cache entry. */
 export function statisticsQueryKey(datasets: Pick<Dataset, '_id'>[]): (string)[] {
-  return ['statistics-full', datasets.map((d) => d._id).join(',')];
+  return ['statistics-full', datasets.map((d) => d._id).sort().join(',')];
 }
 
 /**
@@ -30,20 +31,32 @@ export function statisticsQueryKey(datasets: Pick<Dataset, '_id'>[]): (string)[]
  * the two never diverge.
  */
 export async function computeStatistics(datasets: Dataset[]): Promise<StatisticsData> {
-  const fetched = await mapWithConcurrency(datasets, 6, (d) => getDataset(d._id).catch(() => null));
+  const fetched = await mapWithConcurrency(datasets, 6, async (d) => {
+    const [ds, tasks] = await Promise.all([
+      getDataset(d._id).catch(() => null),
+      listDatasetTasks(d._id).catch(() => [] as Task[]),
+    ]);
+    return { ds, tasks };
+  });
 
   const allQuestions: Question[] = [];
   const dsStats: DsStatRow[] = [];
 
   for (let i = 0; i < datasets.length; i++) {
     const d = datasets[i];
-    const ds = fetched[i];
+    const { ds, tasks } = fetched[i];
     if (!ds) continue;
     const questions = ds.questions ?? [];
     const meta = ds.metadata ?? {};
 
     for (const q of questions) {
-      allQuestions.push({ ...q, dataset_name: ds.name, dataset_id: d._id });
+      allQuestions.push({
+        ...q,
+        dataset_name: ds.name ?? d.name,
+        dataset_id: d._id,
+        created_at: ds.created_at ?? '',
+        dataset_status: meta.status ?? 'unknown',
+      });
     }
 
     const considered = questions.map(isValidationPassed).filter((p) => p !== null) as boolean[];
@@ -51,10 +64,11 @@ export async function computeStatistics(datasets: Dataset[]): Promise<Statistics
       ? (considered.filter(Boolean).length / considered.length) * 100
       : 0;
 
-    const prog = computeDatasetProgress(d, ds, []);
+    const prog = computeDatasetProgress(d, ds, tasks);
 
     dsStats.push({
-      name: ds.name,
+      id: d._id,
+      name: ds.name ?? d.name,
       status: prog.status,
       progress: prog.progressPercent,
       generated: prog.totalQuestionsGenerated,

@@ -1,8 +1,11 @@
-fastapi
-uvicorn
-pymongo
-pydantic
-dotenv
-loguru
+fastapi==0.141.1
+uvicorn==0.52.4
+pymongo==4.16.0
+pydantic==2.13.4
+python-dotenv==1.2.3
+loguru==0.7.3
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+# passlib 1.7.4 fails its bcrypt self-test with bcrypt>=5 ("password cannot be longer than 72 bytes").
+bcrypt==4.0.1
+python-multipart==0.0.32

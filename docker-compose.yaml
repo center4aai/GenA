@@ -1,21 +1,45 @@
+# Общий лог-драйвер: без ротации json-file логи chunker/agent_api за месяцы
+# съедают диск раннера.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+# mem_limit: на хосте три стека GenA (dev/main/genatest) + чужие контейнеры,
+# поэтому лимиты — с запасом к наблюдаемому потреблению, но так, чтобы один
+# стек (~18g в сумме) не мог выесть всю память хоста.
 services:
   agent_api:
     build:
       context: .
       dockerfile: agent_api/Dockerfile
     container_name: ${AGENT_API_CONTAINER_NAME}
-    ports:
+    expose:
       - "8790"
     env_file:
       - ./.env
+    # 4 uvicorn-воркера + langgraph; наблюдаемо ~0.6-0.9g
+    mem_limit: 4g
+    logging: *default-logging
     networks:
       - gena_net
     extra_hosts: 
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     depends_on:
-      - chunker
-#      - ruadapt-qwen
+      chunker:
+        condition: service_healthy
+        required: false
+      chunker_gpu:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   gena_frontend:
     build:
@@ -25,70 +49,172 @@ services:
         VITE_DATASET_API_URL: ${VITE_DATASET_API_URL:-/api/dataset}
         VITE_AGENT_API_URL: ${VITE_AGENT_API_URL:-/api/agent}
         VITE_CHUNKER_URL: ${VITE_CHUNKER_URL:-/api/chunker}
+        VITE_AUTH_MODE: ${VITE_AUTH_MODE:-disabled}
+        VITE_DEFAULT_LOCALE: ${VITE_DEFAULT_LOCALE:-en}
     container_name: ${GENA_FRONTEND_CONTAINER_NAME:-gena_frontend}
     ports:
       - "${WEB_PORT:-27371}:443"
     env_file:
       - ./.env
+    # nginx со статикой; наблюдаемо ~30m
+    mem_limit: 512m
+    logging: *default-logging
     networks:
       - gena_net
     restart: unless-stopped
     depends_on:
-      - dataset_api
-      - agent_api
-      - chunker
-
-  # Legacy Streamlit UI (optional; use profile streamlit to run alongside SPA)
-  gena_web:
-    profiles: ["streamlit"]
-    build: ./gena_web
-    container_name: ${GENA_WEB_CONTAINER_NAME}
-    ports:
-      - "${STREAMLIT_PORT:-27372}:8516"
-    volumes:
-      - ./gena_web:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - ./.env
-    networks:
-      - gena_net
-    restart: unless-stopped
+      dataset_api:
+        condition: service_healthy
+      agent_api:
+        condition: service_healthy
+      chunker:
+        condition: service_healthy
+        required: false
+      chunker_gpu:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "curl", "-fk", "https://127.0.0.1/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   dataset_api:
     build: ./dataset_api
     container_name: ${DATASET_API_CONTAINER_NAME}
-    ports:
+    expose:
       - "8789"
     env_file:
       - ./.env
+    # 4 uvicorn-воркера, GridFS-документы до 50m; наблюдаемо до ~1.9g на dev
+    mem_limit: 3g
+    logging: *default-logging
     networks:
       - gena_net
     restart: unless-stopped
+    # /ready = liveness + ping Mongo (503, пока Mongo недоступна), поэтому
+    # зависимые сервисы не стартуют раньше, чем API реально может отвечать.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8789/ready')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   task_worker:
     build: ./task_worker
     container_name: ${TASK_WORKER_CONTAINER_NAME}
     env_file:
       - ./.env
+    environment:
+      # Stable worker id (instead of a random one per start) so the worker keeps
+      # owning its tasks across restarts and recovery can tell its own tasks apart.
+      WORKER_ID: ${TASK_WORKER_CONTAINER_NAME:-task_worker}
+      # Large textbooks / encyclopaedia volumes (БРЭ ~770pp) need >600s for
+      # markitdown + chunking over HTTP.
+      WORKER_CHUNK_TIMEOUT: ${WORKER_CHUNK_TIMEOUT:-1800}
+    # На SIGTERM воркер дожидается текущего вызова агента и возвращает
+    # незанятые задачи в pending; CI делает `stop task_worker` до `down`.
+    stop_grace_period: 120s
+    # Один поток requests + буферы документов; наблюдаемо ~20m
+    mem_limit: 2g
+    logging: *default-logging
     networks:
       - gena_net
     restart: unless-stopped
     depends_on:
-      - dataset_api
-      - agent_api
+      dataset_api:
+        condition: service_healthy
+      agent_api:
+        condition: service_healthy
+      chunker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   chunker:
     build:
       context: .
       dockerfile: chunker/Dockerfile
     container_name: ${GENA_CHUNKER_CONTAINER_NAME}
-    ports:
+    expose:
       - "8517"
     env_file:
       - ./.env
+    # markitdown/pdfplumber на больших PDF; пики в разы выше idle ~0.2g.
+    # Эмбеддинги для метода semantic считает отдельный сервис embedder (TEI).
+    mem_limit: 8g
+    logging: *default-logging
+    networks:
+      - gena_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8517/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Эмбеддер для метода чанкинга semantic: Hugging Face Text Embeddings
+  # Inference на одной GPU (~1 ГБ видеопамяти для USER-bge-m3), OpenAI-совместимый
+  # /v1/embeddings. Чанкер ходит в него по CHUNKER_EMBEDDING_URL=http://embedder:80/v1.
+  # Образ собран под Ampere (sm_86, RTX A6000); для другой GPU — другой тег TEI.
+  # Веса скачиваются с Hugging Face при первом старте (~2 мин) в том embedder_cache.
+  embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:86-1.8
+    container_name: ${GENA_EMBEDDER_CONTAINER_NAME}
+    command:
+      - --model-id
+      - ${EMBEDDER_MODEL_ID:-deepvk/USER-bge-m3}
+      - --max-client-batch-size
+      - "64"
+      - --max-batch-tokens
+      - "16384"
+      - --auto-truncate
+    expose:
+      - "80"
+    volumes:
+      - embedder_cache:/data
+    mem_limit: 4g
+    logging: *default-logging
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${EMBEDDER_GPU_DEVICE:-1}"]
+              capabilities: [gpu]
+    networks:
+      - gena_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Первый старт качает веса (~2.3 ГБ).
+      start_period: 600s
+
+  # Optional GPU-backed chunker — enable with:
+  #   docker compose --profile gpu up -d --scale chunker=0
+  # chunker_gpu registers DNS alias "chunker" so internal URLs stay unchanged.
+  chunker_gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: chunker/Dockerfile
+    container_name: ${GENA_CHUNKER_CONTAINER_NAME}
+    expose:
+      - "8517"
+    env_file:
+      - ./.env
+    mem_limit: 8g
+    logging: *default-logging
     deploy:
       resources:
         reservations:
@@ -96,34 +222,19 @@ services:
             - capabilities: [gpu]
     runtime: nvidia
     networks:
-      - gena_net
+      gena_net:
+        aliases:
+          - chunker
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8517/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
-  # ruadapt-qwen:
-  #   image: ghcr.io/ggml-org/llama.cpp:server-cuda
-  #   container_name: ${RUADAPT_QWEN_SERVER_CONTAINER_NAME}
-  #   restart: unless-stopped
-  #   ports:
-  #     - "27362:8000"
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - capabilities: [gpu]
-  #   volumes:
-  #     - /home/ivan/models:/models
-  #   command: >
-  #     -m /models/${MODEL_NAME}
-  #     --parallel 1
-  #     --ctx-size 16384
-  #     --port 8000
-  #     --n-gpu-layers 60
-  #     --main-gpu 0
-  #     --tensor-split 1.0
-  #     -fa
-  #   runtime: nvidia
-  #   networks:
-  #     - gena_net
+volumes:
+  embedder_cache:
 
 networks:
   gena_net:

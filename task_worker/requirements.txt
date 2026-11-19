@@ -1,5 +1,4 @@
-requests
-pymongo
-python-dotenv
-loguru
-pydantic
+requests==2.34.2
+pymongo==4.16.0
+python-dotenv==1.2.3
+pydantic==2.13.4

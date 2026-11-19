@@ -29,10 +29,9 @@
 ```bash
 docker compose up -d gena_frontend dataset_api agent_api chunker task_worker
 # SPA: https://localhost:${WEB_PORT:-27371}
-# Legacy Streamlit (optional): docker compose --profile streamlit up -d gena_web
 ```
 
 ## Remaining optional enhancements
-- Native XLSX export (currently CSV; Streamlit used openpyxl)
+- Native XLSX export (currently CSV)
 - Plotly-level interactive charts (CSS bar charts used for zero-deps visuals)
 - Playwright E2E against live backend in CI

@@ -1,0 +1,301 @@
+{
+ "document": "Family_code_Russian_Federation_1-4.docx",
+ "num_chunks": 59,
+ "chunks": [
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_1",
+   "sha256": "a0f7a6403f3707598523cf24d2d75ebb033f521fe726aecd76f6cd7a7589fda1",
+   "chars": 989
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_2",
+   "sha256": "8f4ff545ced243d8f19616f422867073865b835be69bc16e95f89aa83c5d3e01",
+   "chars": 227
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_3",
+   "sha256": "6d88d1ee51775bf78c2607dda08f620eb55659cbb3ca5edf35d08b2eac3d0925",
+   "chars": 489
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_4",
+   "sha256": "faa196febd7266642ee7e7921a2a48ca5f5058ea2aee7197d45a81e7465ea334",
+   "chars": 762
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_5",
+   "sha256": "be4a9a03cea6e8920eabd8d771031b99da2c53a6f2b60f3bd464c98ffb26686c",
+   "chars": 801
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_6",
+   "sha256": "02fe28f92abf66db7bc538d140c948e48ceab32306e903cb735fc5c13c8da7ec",
+   "chars": 339
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_7",
+   "sha256": "a5515c5b22b12b803b043bc553060ef5ed2181ea670abc7aa3eb81d36205edfe",
+   "chars": 710
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_8",
+   "sha256": "9db72ab0624cc88b645d665729f18419f04891e6b581dd911e5a5b1f90e8b72e",
+   "chars": 426
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_9",
+   "sha256": "ea53c168f0bcc6c7f220c1e99c673ea7514fa905bc33423b43dfd51e85ba864a",
+   "chars": 484
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_10",
+   "sha256": "23eaac89079ed75910d87ccc514623d3078642a5120b7f0329d6e9c47d7385c1",
+   "chars": 726
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_11",
+   "sha256": "419a3f81b4469f46ab770b256974d7b28f11ef8cce35f2da536a3572c197c62e",
+   "chars": 319
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_12",
+   "sha256": "91c0db23e1a5a1665af69c40b3338c3622474b1e37fd917abc16070d48548164",
+   "chars": 425
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_13",
+   "sha256": "53776f90f7fad97312788566ce86a78698ba1777c637c87e72258a792e7605fb",
+   "chars": 490
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_14",
+   "sha256": "31e1276bb4f61c23dec05799ca9e2b95cdc08a12c08f3f022ca6f24b79c74d89",
+   "chars": 501
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_15",
+   "sha256": "38dc1095816149d1cb16fbc0874857b04782aecd54b8139cb0f601c3e92fd8f2",
+   "chars": 247
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_16",
+   "sha256": "5a22484b4a1df2c2eb5b9beb3e010002b2e629586926beffb4b3879b9fa08fcf",
+   "chars": 431
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_17",
+   "sha256": "23b0dcc9c0678dfdfa668fb047305216c0a7336518629d5d9f1b22bdf3f29df8",
+   "chars": 599
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_18",
+   "sha256": "551e3238f77c0d85dd08494d6e8ba71366fec94842235a90e52531765af261c1",
+   "chars": 243
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_19",
+   "sha256": "d9f7d1fbdf457e8b5e25610f1555fd35cf0de6f4c89b47277e5f6b5fbfebc82c",
+   "chars": 292
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_20",
+   "sha256": "a98610e5e9ad540ad546ee911aabdcbdebd39a66c621899b844fafb89ff20fe9",
+   "chars": 378
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_21",
+   "sha256": "99d556cd081c07f1c331cf0647e1e2086fd6b7e759c562f3b928ff163057f73a",
+   "chars": 195
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_22",
+   "sha256": "cbafbdbc0353375673b6ac9a8f9dd857ded1f8d2b09c40dc6292ac131d11c9ab",
+   "chars": 268
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_23",
+   "sha256": "25fced320c5d564e0822c62ef4b51a6a6ec70fd15ca25d8af6f5e74db77e70ff",
+   "chars": 301
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_24",
+   "sha256": "592af047694fae5f7d7e06a1172e704fc2298901d5e4ac1826f6a295cbda532e",
+   "chars": 867
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_25",
+   "sha256": "81e29997fe2bea793eed2d203c2b02bb8e4fa000da998705390815e708b82449",
+   "chars": 526
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_26",
+   "sha256": "65ea898a95307984610adfd626ea6f15fa1b224d08c791552f4653efc241cfda",
+   "chars": 287
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_27",
+   "sha256": "10355d929f5453a09c7844e079396613da4a95d280a50ebca2bc2ec1d17b610a",
+   "chars": 222
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_28",
+   "sha256": "abf1948072da59f3fbddd64e51004a0cdbba5b904b16ef34f129de71bf16aab2",
+   "chars": 439
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_29",
+   "sha256": "21f04c43202f7796e62104c827eb46d85c0ffa756fe76d40984f6e979e2098cc",
+   "chars": 128
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_30",
+   "sha256": "d668a78d26bacab48bdea6b68c4d7e70c132f9d6de63e420b25dd56a3fd3fca9",
+   "chars": 519
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_31",
+   "sha256": "79e4117c576b78edb28fba6c57d7399badfa46cd77cdbe9032ea63de0bdb3aed",
+   "chars": 584
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_32",
+   "sha256": "febcb3258cd9797e427353e0ca99cab03c60fb6ad94e37f41dce82f4b46755aa",
+   "chars": 364
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_33",
+   "sha256": "099ae7eb3b36c1f5b54a03bbfb3f5618a120dc65aaae37c0378dac9d82b2b852",
+   "chars": 755
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_34",
+   "sha256": "8a342abf84e10ebcdd1a791deb77004ccfb8c4a81696a71d42d95a6640d998b4",
+   "chars": 642
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_35",
+   "sha256": "799b79e7d7395050b81d68d4709903d7a5b44bc4c03472b71324b224e1a6adcf",
+   "chars": 346
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_36",
+   "sha256": "06342cd78187b7153795cc395249e2e653084845d46aaba00a43480ccf33f5eb",
+   "chars": 473
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_37",
+   "sha256": "5b34c6925c0cece958bc3ea65c76d00ce6516662a2031885ce336adf4ac2a01a",
+   "chars": 290
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_38",
+   "sha256": "dad87697216cc8a219390b4cf497941bba6e1c46f3d1ca78d256fff40f21ee09",
+   "chars": 337
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_39",
+   "sha256": "f9b8da589a7077e7dd1e0fb1e85e04638ba29bd834b9755ebdeaba14508fd18a",
+   "chars": 289
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_40",
+   "sha256": "407c2c27e63aadd050bc4f21de69e8a1a7a3b4ac3e273e901545b20a94308dcb",
+   "chars": 252
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_41",
+   "sha256": "ac79e8c1de4ea4ee12e3c9010708d4071d4f29a200e635addc0e85984da8a97d",
+   "chars": 241
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_42",
+   "sha256": "221b42fb12ebc2b88d47a3d8ce42920c9da4dcc6ffb91a9bc1a39410200e3fd8",
+   "chars": 332
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_43",
+   "sha256": "6c1dadb84796a406b228fe5affcf1021caf8946a4edc2140957659937e6e8f16",
+   "chars": 614
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_44",
+   "sha256": "dd444a1ac5e4369fd5af8a3450eef650897d5b9e8495956d6d99812f118b3937",
+   "chars": 346
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_45",
+   "sha256": "b640816dd0997ce56db9430e359bfb168bcda1f691ea85be17f4a73bef9e3e5d",
+   "chars": 401
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_46",
+   "sha256": "c0b166e0ef55358c0de3eb3af7f81e0a09bc83b1f977eed250cf744a27ae05cf",
+   "chars": 614
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_47",
+   "sha256": "46b638d832739abe8480574fd26bad0936049bd22bee73ed570a541b3bcedcbd",
+   "chars": 604
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_48",
+   "sha256": "09ffc6a1cae88f774720bf91fe2b88c6fa1ebaa70c26395bdc093aa9b98bbcd4",
+   "chars": 333
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_49",
+   "sha256": "7f7533af9fc94148a1f76773dd4b43879a8d8ff679e648ae44af4af342f60698",
+   "chars": 291
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_50",
+   "sha256": "c1b9333e952b23067afdeb3061b3c4756853c0fd1d0048868d2a63b6ce39f208",
+   "chars": 602
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_51",
+   "sha256": "29a63fcdfb289c62281d4f74f2a059328aaa38a44d84d05185bef29661205f41",
+   "chars": 715
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_52",
+   "sha256": "432306a480993734a6ac3b7acdbc11c044c82923eedf031038a17f50545285e3",
+   "chars": 250
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_53",
+   "sha256": "540b9789a35ebfe619a76db4d7b81932e192873a41adc64a04a4e459bc835f62",
+   "chars": 432
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_54",
+   "sha256": "36a935fefa832287cbbe974f9ad4122ef3278a5bbd7aa16c0aba9fbd207a0e3b",
+   "chars": 756
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_55",
+   "sha256": "f7fb27653563c0d8387a17d9fd9fce0d9e8196f89c49d59a35784ba7047de294",
+   "chars": 255
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_56",
+   "sha256": "d9bb35a7769c45735137fd5b4958f5392c16b55c1e10e04aa01c3a8bc66a46ae",
+   "chars": 830
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_57",
+   "sha256": "03382e1fcd8c3430be63d8d1a4a7800882692f278af75e5235c957e1b03c8de3",
+   "chars": 810
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_58",
+   "sha256": "9142dd95bed8d1aa0896697b4a02977fae4be4f1e59d41c025f826aca97932f1",
+   "chars": 503
+  },
+  {
+   "fragment_id": "Family_code_Russian_Federation_1-4_chunk_59",
+   "sha256": "79fd318e879e56b8017cb4496c65dffb6f910a00a5889f13d0d677ba47d55416",
+   "chars": 222
+  }
+ ]
+}

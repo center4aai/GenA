@@ -1,82 +1,205 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useBlocker, useSearchParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  listDatasets,
   getDataset,
-  listDatasetVersions,
   listDatasetChunks,
-  updateDataset,
+  listDatasetVersions,
+  listDatasets,
+  patchDatasetQuestions,
+  getRevalidationRunItems,
+  getRevalidationState,
+  retryRevalidation,
+  startRevalidation,
 } from '@/shared/api/dataset';
-import type { Question } from '@/shared/types/documents';
-import { useAuth, isExpert } from '@/features/auth/authStore';
+import type { DatasetDetail, Question, RevalidationScope } from '@/shared/types/documents';
+import { isExpert, useAuth } from '@/features/auth/authStore';
+import { datasetEditorStatus, isDatasetVisibleInEditor } from '@/shared/lib/datasetVisibility';
+import { compareTimestamps } from '@/shared/lib/dateTime';
+import { formatUserError } from '@/shared/lib/errorMessages';
+import { buildExtendedExportRows, buildResultsExportRows, downloadCsv } from '@/shared/lib/extendedExport';
+import { buildRevalidationRunRows } from '@/shared/lib/revalidationExport';
+import { useSelectableModels } from '@/shared/api/useSelectableModels';
+import { buildGiftExport, downloadGift } from '@/shared/lib/giftExport';
+import { parseOptionsText } from '@/shared/lib/optionsFormat';
+import { draftFromQuestion, draftIsDirty, draftToEdit, type QuestionDraft } from '@/shared/lib/questionDraft';
+import { buildQuestionPatches, exportTogglePatch, isExcludedFromExport } from '@/shared/lib/questionEdits';
+import { applyQuestionEdits, ensureQids } from '@/shared/lib/questionFields';
 import {
-  asOptionsText,
-  coerceOptionsLike,
-  normOptions,
-} from '@/shared/lib/optionsFormat';
-import {
-  formatRetryLine,
-  formatValidationBreakdown,
-  parseValidationDetails,
-  parseValidationJustifications,
-} from '@/shared/lib/validation';
-import { isValidationPassed } from '@/shared/lib/progress';
-import { diffVersions } from '@/shared/lib/diffVersions';
-import { buildExtendedExportRows, buildResultsExportRows } from '@/shared/lib/extendedExport';
+  applyQuestionFilters,
+  chunkFilterOptions,
+  emptyFilters,
+  indexQuestions,
+  type EditingFilter,
+  type QuestionFilterState,
+} from '@/shared/lib/questionFilters';
+import { computeQuestionStats } from '@/shared/lib/questionStats';
+import { omitKey } from '@/shared/lib/records';
+import { shuffleQuestions } from '@/shared/lib/shuffleOptions';
+import { latestVersion, versionByNumber, versionOptionLabel } from '@/shared/lib/versionLabel';
+import { editNeedsRevalidation } from '@/shared/lib/revalidation';
+import { isRevalidating } from '@/shared/lib/revalidationState';
 import { downloadXlsx } from '@/shared/lib/xlsx';
-import { questionTypeLabel, levelLabel, toCategoryData, truncIso } from '@/shared/lib/labels';
+import { usePageTitle } from '@/shared/i18n/usePageTitle';
 import { PageHeader } from '@/shared/ui/PageHeader';
-import { MetricCard } from '@/shared/ui/MetricCard';
-import { BarChartRc } from '@/shared/ui/charts';
-import { StatusBanner, LoadingState, EmptyState } from '@/shared/ui/StatusBanner';
+import { EmptyState, LoadingState } from '@/shared/ui/StatusBanner';
+import { DatasetCard } from './DatasetCard';
+import { RevalidationAccordion } from './RevalidationAccordion';
+import { DatasetsTable } from './DatasetsTable';
+import { PrintSheet, printQuestionSheet } from './PrintSheet';
+import { QuestionCard } from './QuestionCard';
+import { QuestionsSection } from './QuestionsSection';
 
-const PAGE_SIZE = 10;
+const DEFAULT_PAGE_SIZE = 10;
 
-function ensureQids(datasetId: string, questions: Question[]): Question[] {
-  return questions.map((q, idx) => ({
-    ...q,
-    question_id: q.question_id ?? `${datasetId}:${String(idx).padStart(5, '0')}`,
-  }));
-}
+type SaveStatus = { status: 'saving' } | { status: 'saved' } | { status: 'error'; message: string };
 
 export function DatasetEditorPage() {
+  const { t } = useTranslation(['results', 'common', 'nav', 'errors', 'advanced', 'create']);
+  usePageTitle('results', 'nav');
   const auth = useAuth();
   const expert = isExpert(auth.role);
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
-  const [compareV1, setCompareV1] = useState<number | null>(null);
-  const [compareV2, setCompareV2] = useState<number | null>(null);
-  const [showCompare, setShowCompare] = useState(false);
+  const [mineOnly, setMineOnly] = useState(!expert);
+  const [dsSearch, setDsSearch] = useState('');
+  const [pinnedFallbackId, setPinnedFallbackId] = useState<string | null>(null);
+  // Per-question form state, keyed by question_id. Only dirty drafts are kept,
+  // so `Object.keys(drafts)` is exactly the set of questions with unsaved edits.
+  const [drafts, setDrafts] = useState<Record<string, QuestionDraft>>({});
+  const [saveState, setSaveState] = useState<Record<string, SaveStatus>>({});
+  const [togglePending, setTogglePending] = useState<Set<string>>(() => new Set());
+  const [pendingFilters, setPendingFilters] = useState<QuestionFilterState>(emptyFilters);
+  const [appliedFilters, setAppliedFilters] = useState<QuestionFilterState>(emptyFilters);
   const [page, setPage] = useState(1);
-  const [edits, setEdits] = useState<Record<number, Partial<Question>>>({});
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [shuffleOnExport, setShuffleOnExport] = useState(false);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
 
+  // ── datasets ──
   const { data: datasetsRaw = [], isLoading: loadingList, isError: listError } = useQuery({
-    queryKey: ['datasets'],
-    queryFn: listDatasets,
+    queryKey: ['datasets', mineOnly ? 'mine' : 'all'],
+    queryFn: () => listDatasets({ mine: mineOnly }),
   });
 
+  // Sets whose generation failed critically cannot be fixed here, so they are not listed.
   const datasets = useMemo(
-    () => [...datasetsRaw].sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''))),
+    () =>
+      datasetsRaw
+        .filter(isDatasetVisibleInEditor)
+        .sort((a, b) => compareTimestamps(b.created_at, a.created_at)),
     [datasetsRaw],
   );
 
-  const activeId = selectedId ?? datasets[0]?._id ?? null;
+  useEffect(() => {
+    const param = searchParams.get('dataset');
+    // Adopt the URL parameter once; re-running on every list refresh yanked the
+    // selection back while drafts keyed to another dataset stayed staged.
+    if (param && !selectedId && datasets.some((d) => d._id === param)) {
+      setSelectedId(param);
+    }
+  }, [searchParams, datasets, selectedId]);
 
-  const { data: versions = [] } = useQuery({
+  // Pin the fallback so the "first dataset" does not change under the user
+  // when the list reorders.
+  useEffect(() => {
+    if (pinnedFallbackId && datasets.some((d) => d._id === pinnedFallbackId)) return;
+    setPinnedFallbackId(datasets[0]?._id ?? null);
+  }, [datasets, pinnedFallbackId]);
+
+  const activeId =
+    (selectedId && datasets.some((d) => d._id === selectedId) ? selectedId : null) ??
+    pinnedFallbackId ??
+    datasets[0]?._id ??
+    null;
+  const activeDs = datasets.find((d) => d._id === activeId);
+
+  // ── version ──
+  const versionsQuery = useQuery({
     queryKey: ['dataset-versions', activeId],
     queryFn: () => listDatasetVersions(activeId!),
     enabled: !!activeId,
   });
+  const versions = versionsQuery.data ?? [];
 
-  const version = selectedVersion ?? versions[0]?.version ?? null;
+  // Default is the most recently created or edited version, so the dataset
+  // query waits for the versions list instead of guessing `current_version`
+  // and jumping afterwards.
+  const version =
+    selectedVersion ??
+    (versionsQuery.isSuccess
+      ? latestVersion(versions)?.version ?? activeDs?.current_version ?? null
+      : versionsQuery.isError
+        ? activeDs?.current_version ?? null
+        : null);
 
-  const { data: dataset, isLoading: loadingDataset } = useQuery({
+  const datasetQuery = useQuery({
     queryKey: ['dataset', activeId, version],
     queryFn: () => getDataset(activeId!, version ?? undefined),
     enabled: !!activeId && version != null,
   });
+  const dataset = datasetQuery.data;
+
+  // ── quality revalidation of the selected version ──
+  const revalidationKey = ['revalidation', activeId, version] as const;
+  const revalidationQuery = useQuery({
+    queryKey: revalidationKey,
+    queryFn: () => getRevalidationState(activeId!, version!),
+    enabled: !!activeId && version != null,
+    // Poll only while a run is active; refetch the questions when it ends.
+    refetchInterval: (query) => (query.state.data?.active_run ? 5_000 : false),
+  });
+  const revalidation = revalidationQuery.data ?? null;
+  const revalidating = isRevalidating(revalidation);
+  const [wasRevalidating, setWasRevalidating] = useState(false);
+  useEffect(() => {
+    if (revalidating) {
+      setWasRevalidating(true);
+    } else if (wasRevalidating) {
+      setWasRevalidating(false);
+      queryClient.invalidateQueries({ queryKey: ['dataset', activeId] });
+    }
+  }, [revalidating, wasRevalidating, queryClient, activeId]);
+  const [revalidationError, setRevalidationError] = useState<string | null>(null);
+  const revalidationMutation = useMutation({
+    mutationFn: (
+      action: { kind: 'start'; scope: RevalidationScope; modelId?: string } | { kind: 'retry' },
+    ) =>
+      action.kind === 'start'
+        ? startRevalidation(activeId!, version!, action.scope, action.modelId)
+        : retryRevalidation(activeId!, version!),
+    onMutate: () => setRevalidationError(null),
+    onSuccess: (state) => {
+      queryClient.setQueryData(revalidationKey, state);
+    },
+    onError: (error) => {
+      setRevalidationError(formatUserError(error, t, 'save'));
+      queryClient.invalidateQueries({ queryKey: ['revalidation', activeId] });
+    },
+  });
+
+  // Validators for revalidation: the same list as for a new generation.
+  const { models: llmModels, allModels: allLlmModels } = useSelectableModels({ enabled: expert });
+  const [downloadingRun, setDownloadingRun] = useState(false);
+  async function downloadRevalidationRun(runId: string) {
+    setDownloadingRun(true);
+    setRevalidationError(null);
+    try {
+      const { items } = await getRevalidationRunItems(activeId!, version!, runId);
+      downloadCsv(
+        `${dataset?.name ?? 'dataset'}_v${version}_revalidation_${runId.slice(0, 8)}.csv`,
+        buildRevalidationRunRows(items),
+      );
+    } catch (error) {
+      setRevalidationError(formatUserError(error, t, 'load'));
+    } finally {
+      setDownloadingRun(false);
+    }
+  }
 
   const { data: chunks = [] } = useQuery({
     queryKey: ['dataset-chunks', activeId],
@@ -84,413 +207,393 @@ export function DatasetEditorPage() {
     enabled: !!activeId,
   });
 
+  // ── questions of the selected version ──
   const questions = useMemo(
     () => ensureQids(activeId ?? '', dataset?.questions ?? []),
     [activeId, dataset?.questions],
   );
+  const stats = useMemo(() => computeQuestionStats(questions), [questions]);
+  const chunkOptions = useMemo(() => chunkFilterOptions(questions), [questions]);
+  const unsavedIds = useMemo(() => new Set(Object.keys(drafts)), [drafts]);
+  const filtered = useMemo(
+    () => applyQuestionFilters(indexQuestions(questions), appliedFilters, { unsavedIds }),
+    [questions, appliedFilters, unsavedIds],
+  );
 
-  const numPages = Math.max(1, Math.ceil(questions.length / PAGE_SIZE));
-  const start = (page - 1) * PAGE_SIZE;
-  const pageQuestions = questions.slice(start, start + PAGE_SIZE);
+  const effectivePageSize = pageSize === 0 ? Math.max(filtered.length, 1) : pageSize;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / effectivePageSize));
+  const safePage = Math.min(page, totalPages);
+  const pageItems = filtered.slice((safePage - 1) * effectivePageSize, safePage * effectivePageSize);
 
-  const passedRate = useMemo(() => {
-    const flags = questions.map(isValidationPassed).filter((p) => p !== null) as boolean[];
-    if (!flags.length) return '—';
-    return `${((flags.filter(Boolean).length / flags.length) * 100).toFixed(1)}%`;
-  }, [questions]);
+  useEffect(() => {
+    setPage((p) => Math.min(p, totalPages));
+  }, [totalPages]);
 
-  const typeData = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const q of questions) {
-      const t = questionTypeLabel(q.question_type);
-      c[t] = (c[t] ?? 0) + 1;
-    }
-    return toCategoryData(c);
-  }, [questions]);
+  // ── unsaved-work protection ──
+  const unsavedCount = unsavedIds.size;
+  useEffect(() => {
+    if (!unsavedCount) return undefined;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [unsavedCount]);
 
-  const provData = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const q of questions) {
-      const raw = q.sensitivity_level ?? q.provocativeness;
-      if (raw == null || String(raw).trim() === '') continue;
-      c[levelLabel(raw)] = (c[levelLabel(raw)] ?? 0) + 1;
-    }
-    return toCategoryData(c, ['Low', 'Medium', 'High']);
-  }, [questions]);
+  const blocker = useBlocker(unsavedCount > 0);
+  useEffect(() => {
+    if (blocker.state !== 'blocked') return;
+    if (window.confirm(t('results:unsavedLeave'))) blocker.proceed();
+    else blocker.reset();
+  }, [blocker, t]);
 
-  const scoreData = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const q of questions) {
-      const raw = String(q.validation_score ?? '');
-      const total = raw.split('/')[0]?.trim();
-      if (total) c[total] = (c[total] ?? 0) + 1;
-    }
-    return Object.entries(c)
-      .sort(([a], [b]) => Number(a) - Number(b))
-      .map(([label, value]) => ({ label, value }));
-  }, [questions]);
+  function confirmDiscard(): boolean {
+    return unsavedCount === 0 || window.confirm(t('results:unsavedLeave'));
+  }
 
-  const editCount = Object.keys(edits).length;
+  function resetContext() {
+    setDrafts({});
+    setSaveState({});
+    setPendingFilters(emptyFilters());
+    setAppliedFilters(emptyFilters());
+    setPage(1);
+    setExportMsg(null);
+  }
 
-  const { data: compareResult } = useQuery({
-    queryKey: ['version-compare', activeId, compareV1, compareV2, showCompare],
-    queryFn: async () => {
-      const [ds1, ds2] = await Promise.all([
-        getDataset(activeId!, compareV1!),
-        getDataset(activeId!, compareV2!),
-      ]);
-      return diffVersions(ds1, ds2);
-    },
-    enabled: showCompare && !!activeId && compareV1 != null && compareV2 != null && compareV1 !== compareV2,
-  });
+  function selectDataset(id: string) {
+    if (id === activeId || !confirmDiscard()) return;
+    setSelectedId(id);
+    setSelectedVersion(null);
+    resetContext();
+  }
 
-  const saveMutation = useMutation({
-    mutationFn: async () => {
-      const updated = questions.map((q, idx) => {
-        const e = edits[idx];
-        if (!e) {
-          return {
-            question_id: q.question_id,
-            chunk_id: q.chunk_id,
-            question_type: q.question_type,
-            task: q.task,
-            options: q.options,
-            correct_answer: q.correct_answer,
-            provocativeness: q.provocativeness,
-            difficulty: q.difficulty,
-            validation_passed: q.validation_passed,
-            validation_score: q.validation_score,
-            validation_threshold: q.validation_threshold,
-            validation_details: q.validation_details,
-            validation_justifications: q.validation_justifications,
-            retry_count: q.retry_count,
-            source_chunk: q.source_chunk,
-          };
-        }
-        return {
-          question_id: q.question_id,
-          chunk_id: q.chunk_id ?? e.chunk_id,
-          question_type: e.question_type ?? q.question_type,
-          task: e.task ?? q.task,
-          options: e.options != null ? coerceOptionsLike(q.options, e.options) : q.options,
-          correct_answer: e.correct_answer ?? q.correct_answer,
-          provocativeness: e.provocativeness ?? q.provocativeness,
-          difficulty: e.difficulty !== undefined ? e.difficulty : q.difficulty,
-          validation_passed: q.validation_passed,
-          validation_score: q.validation_score,
-          validation_threshold: q.validation_threshold,
-          validation_details: q.validation_details,
-          validation_justifications: q.validation_justifications,
-          retry_count: q.retry_count,
-          source_chunk: q.source_chunk,
-        };
-      });
-      const metadata = {
-        ...(dataset?.metadata ?? {}),
-        edited_at: new Date().toISOString(),
-        edited_by: auth.username ?? 'expert',
-      };
-      return updateDataset(activeId!, { questions: updated, metadata });
-    },
-    onSuccess: () => {
-      setEdits({});
-      queryClient.invalidateQueries({ queryKey: ['dataset', activeId] });
-      queryClient.invalidateQueries({ queryKey: ['dataset-versions', activeId] });
-    },
-  });
+  function selectVersion(n: number) {
+    if (n === version || !confirmDiscard()) return;
+    setSelectedVersion(n);
+    resetContext();
+  }
 
-  function updateEdit(globalIdx: number, patch: Partial<Question>) {
-    setEdits((prev) => {
-      const original = questions[globalIdx] ?? {};
-      const merged = { ...prev[globalIdx], ...patch } as Partial<Question>;
-      // Prune fields that were reverted back to their original values.
-      const pruned: Partial<Question> = {};
-      for (const [key, value] of Object.entries(merged)) {
-        const orig = (original as Record<string, unknown>)[key];
-        const origText = key === 'options' ? asOptionsText(orig) : orig == null ? '' : String(orig);
-        const valText = key === 'options' && typeof value !== 'string' ? asOptionsText(value) : value == null ? '' : String(value);
-        if (valText !== origText) (pruned as Record<string, unknown>)[key] = value;
-      }
-      const next = { ...prev };
-      if (Object.keys(pruned).length) next[globalIdx] = pruned;
-      else delete next[globalIdx];
-      return next;
+  function changeMineOnly(value: boolean) {
+    if (value === mineOnly || !confirmDiscard()) return;
+    setMineOnly(value);
+    setSelectedId(null);
+    setPinnedFallbackId(null);
+    setSelectedVersion(null);
+    resetContext();
+  }
+
+  // ── drafts ──
+  function updateDraft(q: Question, patch: Partial<QuestionDraft>) {
+    const qid = q.question_id;
+    if (!qid) return;
+    setSaveState((prev) => omitKey(prev, qid));
+    setDrafts((prev) => {
+      const next = { ...(prev[qid] ?? draftFromQuestion(q)), ...patch };
+      return draftIsDirty(next, q) ? { ...prev, [qid]: next } : omitKey(prev, qid);
     });
   }
 
+  function cancelDraft(qid: string) {
+    setDrafts((prev) => omitKey(prev, qid));
+    setSaveState((prev) => omitKey(prev, qid));
+  }
+
+  const datasetKey = ['dataset', activeId, version];
+
+  // Manual edits are saved into the version being viewed — only transform
+  // makes a new version — and one question at a time.
+  const saveMutation = useMutation({
+    mutationFn: async ({ q, draft }: { q: Question; draft: QuestionDraft }) => {
+      const qid = String(q.question_id);
+      const edit = draftToEdit(draft, q);
+      const patches = buildQuestionPatches([q], { [qid]: edit });
+      if (!patches.length) throw new Error(t('results:saveMatchedNothing'));
+      const response = await patchDatasetQuestions(activeId!, version!, patches);
+      return { response, edit };
+    },
+    onMutate: ({ q }) => {
+      setSaveState((prev) => ({ ...prev, [String(q.question_id)]: { status: 'saving' } }));
+    },
+    onSuccess: ({ edit }, { q }) => {
+      const qid = String(q.question_id);
+      // Show the saved values at once; the refetch below brings the server's
+      // own stamps (edit_status, needs_revalidation) shortly after.
+      queryClient.setQueryData<DatasetDetail>(datasetKey, (old) =>
+        old
+          ? {
+              ...old,
+              questions: old.questions?.map((x) =>
+                x.question_id === qid
+                  ? {
+                      ...applyQuestionEdits(x, edit),
+                      edit_status: 'user_edited',
+                      ...(editNeedsRevalidation(edit)
+                        ? { validation_is_current: false, needs_revalidation: true }
+                        : {}),
+                    }
+                  : x,
+              ),
+            }
+          : old,
+      );
+      setDrafts((prev) => omitKey(prev, qid));
+      setSaveState((prev) => ({ ...prev, [qid]: { status: 'saved' } }));
+      queryClient.invalidateQueries({ queryKey: ['dataset', activeId] });
+      queryClient.invalidateQueries({ queryKey: ['dataset-versions', activeId] });
+      queryClient.invalidateQueries({ queryKey: ['datasets'] });
+      queryClient.invalidateQueries({ queryKey: ['revalidation', activeId] });
+    },
+    onError: (error, { q }) => {
+      setSaveState((prev) => ({
+        ...prev,
+        [String(q.question_id)]: { status: 'error', message: formatUserError(error, t, 'save') },
+      }));
+    },
+  });
+
+  // The include-in-export switch saves immediately and never becomes an
+  // unsaved edit; the cache is updated optimistically and rolled back on error.
+  const toggleMutation = useMutation({
+    mutationFn: async ({ q, included }: { q: Question; included: boolean }) => {
+      const patch = exportTogglePatch(q, !included);
+      if (!patch) throw new Error(t('results:noQuestionId'));
+      return patchDatasetQuestions(activeId!, version!, [patch]);
+    },
+    onMutate: async ({ q, included }) => {
+      const qid = String(q.question_id);
+      setTogglePending((prev) => new Set(prev).add(qid));
+      await queryClient.cancelQueries({ queryKey: datasetKey });
+      const previous = queryClient.getQueryData<DatasetDetail>(datasetKey);
+      queryClient.setQueryData<DatasetDetail>(datasetKey, (old) =>
+        old
+          ? {
+              ...old,
+              questions: old.questions?.map((x) =>
+                x.question_id === qid ? { ...x, excluded_from_export: !included } : x,
+              ),
+            }
+          : old,
+      );
+      return { previous, key: datasetKey };
+    },
+    onError: (error, { q }, context) => {
+      if (context?.previous) queryClient.setQueryData(context.key, context.previous);
+      setSaveState((prev) => ({
+        ...prev,
+        [String(q.question_id)]: { status: 'error', message: formatUserError(error, t, 'save') },
+      }));
+    },
+    onSettled: (_result, _error, { q }) => {
+      setTogglePending((prev) => {
+        const next = new Set(prev);
+        next.delete(String(q.question_id));
+        return next;
+      });
+      queryClient.invalidateQueries({ queryKey: ['dataset', activeId] });
+    },
+  });
+
+  // ── filters & paging ──
+  function applyFilters() {
+    setAppliedFilters(pendingFilters);
+    setPage(1);
+  }
+
+  function resetFilters() {
+    const empty = emptyFilters();
+    setPendingFilters(empty);
+    setAppliedFilters(empty);
+    setPage(1);
+  }
+
+  /** Replace every filter with a single editing-status bucket (the clickable hints). */
+  function showOnly(bucket: EditingFilter) {
+    const only: QuestionFilterState = { ...emptyFilters(), editing: new Set<EditingFilter>([bucket]) };
+    setPendingFilters(only);
+    setAppliedFilters(only);
+    setPage(1);
+  }
+  const showUnsaved = () => showOnly('unsaved');
+  const showExcluded = () => showOnly('excluded');
+
+  // ── exports (server state of the selected version) ──
+  const exportable = useMemo(() => {
+    let qs = questions
+      .filter((q) => !isExcludedFromExport(q))
+      .map((q) => (typeof q.options === 'string' ? { ...q, options: parseOptionsText(q.options) } : q));
+    if (shuffleOnExport) qs = shuffleQuestions(qs);
+    return qs;
+  }, [questions, shuffleOnExport]);
+
+  function guardEmpty(): boolean {
+    setExportMsg(null);
+    if (!exportable.length) {
+      setExportMsg(t('results:emptyExport'));
+      return false;
+    }
+    return true;
+  }
+
   async function exportResultsXlsx() {
-    const rows = buildResultsExportRows(questions);
-    await downloadXlsx(`${dataset?.name ?? 'dataset'}_v${version}.xlsx`, rows, 'Results');
+    if (!guardEmpty()) return;
+    await downloadXlsx(`${dataset?.name ?? 'dataset'}_v${version}.xlsx`, buildResultsExportRows(exportable, dataset?.metadata?.validation_model_id), 'Results');
+  }
+
+  function exportGift() {
+    if (!guardEmpty()) return;
+    downloadGift(`${dataset?.name ?? 'dataset'}_v${version}.gift`, buildGiftExport(exportable, dataset?.name));
   }
 
   async function exportPipelineXlsx() {
-    const rows = buildExtendedExportRows(questions, chunks);
-    await downloadXlsx(`${dataset?.name ?? 'dataset'}_v${version}_pipeline.xlsx`, rows, 'Pipeline');
+    if (!guardEmpty()) return;
+    await downloadXlsx(
+      `${dataset?.name ?? 'dataset'}_v${version}_pipeline.xlsx`,
+      buildExtendedExportRows(exportable, chunks, dataset?.metadata?.validation_model_id),
+      'Pipeline',
+    );
   }
 
-  if (loadingList) return <LoadingState label="Loading datasets…" />;
+  function printSheet() {
+    if (!guardEmpty()) return;
+    printQuestionSheet();
+  }
+
+  // ── render ──
+  if (loadingList) return <LoadingState label={t('common:loading')} />;
   if (listError) {
     return (
       <div>
-        <PageHeader title="Results & Editor" subtitle="Could not load datasets. Check API connection and sign in." />
+        <PageHeader title={t('results:title')} subtitle={t('results:couldNotLoad')} />
       </div>
     );
   }
-
   if (!datasets.length) {
     return (
       <div>
-        <PageHeader title="Results & Editor" subtitle="Browse generated questions, edit inline, compare versions, and export." />
-        <EmptyState title="No datasets yet" description="Generate a dataset using Data Preprocessing." />
+        <PageHeader title={t('results:title')} subtitle={t('results:subtitle')} />
+        <EmptyState title={t('results:noDatasets')} />
       </div>
     );
   }
 
+  const readOnly = !expert;
+  const setReady = activeDs ? datasetEditorStatus(activeDs) === 'completed' : false;
+  const selectedVersionInfo = versionByNumber(versions, version);
+
   return (
-    <div>
-      <PageHeader
-        title="Results & Editor"
-        subtitle="Browse generated questions, edit inline, compare versions, and export."
+    <div className="space-y-8">
+      <PageHeader title={t('results:title')} subtitle={t('results:subtitle')} />
+
+      <DatasetsTable
+        datasets={datasets}
+        activeId={activeId}
+        onSelect={selectDataset}
+        mineOnly={mineOnly}
+        onMineOnlyChange={changeMineOnly}
+        search={dsSearch}
+        onSearchChange={setDsSearch}
       />
 
-      <section className="space-y-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Available Datasets</h2>
-        <div className="flex flex-col gap-3 sm:flex-row">
-          <select
-            className="input-field max-w-xl"
-            value={activeId ?? ''}
-            onChange={(e) => {
-              setSelectedId(e.target.value);
-              setSelectedVersion(null);
-              setPage(1);
-              setEdits({});
-              setShowCompare(false);
-            }}
-          >
-            {datasets.map((ds) => (
-              <option key={ds._id} value={ds._id}>
-                {ds.name} (v{ds.current_version ?? '?'}) — {ds._id.slice(0, 8)}
-              </option>
-            ))}
-          </select>
-
-          {versions.length > 0 && (
-            <select
-              className="input-field max-w-xs"
-              value={version ?? ''}
-              onChange={(e) => {
-                setSelectedVersion(parseInt(e.target.value, 10));
-                setPage(1);
-                setEdits({});
-              }}
-            >
-              {versions.map((v) => (
-                <option key={v.version} value={v.version}>
-                  Version {v.version} ({v.created_at.slice(0, 10)})
-                </option>
-              ))}
-            </select>
-          )}
-        </div>
-      </section>
-
-      {loadingDataset && <div className="mt-6"><LoadingState label="Loading dataset…" /></div>}
+      {(datasetQuery.isLoading || (!!activeId && versionsQuery.isLoading)) && (
+        <LoadingState label={t('common:loading')} />
+      )}
 
       {dataset && (
         <>
-          <div className="mt-6 card">
-            <h3 className="text-lg font-semibold">{dataset.name}</h3>
-            <p className="mt-1 text-sm text-slate-600">{dataset.description || 'No description'}</p>
-            <dl className="mt-4 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
-              <div><dt className="text-slate-500">Source document</dt><dd>{dataset.source_document ?? '—'}</dd></div>
-              <div><dt className="text-slate-500">Current version</dt><dd>{dataset.current_version ?? '?'}</dd></div>
-              <div><dt className="text-slate-500">Viewing version</dt><dd>{dataset.requested_version ?? version}</dd></div>
-              <div><dt className="text-slate-500">Created</dt><dd>{truncIso(dataset.created_at)}</dd></div>
-              <div><dt className="text-slate-500">Last updated</dt><dd>{truncIso(dataset.updated_at ?? dataset.metadata?.last_updated)}</dd></div>
-              <div><dt className="text-slate-500">Status</dt><dd>{dataset.metadata?.status ?? '—'}</dd></div>
-            </dl>
-            <div className="mt-4 grid gap-4 sm:grid-cols-2">
-              <MetricCard label="Questions" value={questions.length} />
-              <MetricCard label="Avg validation rate" value={passedRate} tone={passedRate === '—' ? 'default' : 'success'} />
-            </div>
-          </div>
-
-          {questions.length > 0 && (
-            <section className="mt-8 grid gap-6 lg:grid-cols-3">
-              <BarChartRc title="By Question Type" data={typeData} color="#3f6b4f" />
-              <BarChartRc title="By Sensitivity" data={provData} color="#8b5cf6" />
-              <BarChartRc title="By Validation Score" data={scoreData} color="#10b981" />
-            </section>
-          )}
-
-          <section className="mt-8">
-            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <h2 className="font-semibold">
-                Questions
-                {editCount > 0 && (
-                  <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
-                    {editCount} unsaved edit{editCount > 1 ? 's' : ''}
-                  </span>
-                )}
-              </h2>
-              <div className="flex items-center gap-2 text-sm">
-                <button type="button" className="btn-secondary" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
-                  Prev
-                </button>
-                <span className="text-slate-500">Page</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={numPages}
-                  value={page}
-                  onChange={(e) => {
-                    const p = parseInt(e.target.value, 10);
-                    if (!Number.isNaN(p)) setPage(Math.min(numPages, Math.max(1, p)));
-                  }}
-                  className="input-field w-16 text-center"
+          <DatasetCard
+            dataset={dataset}
+            listItem={activeDs}
+            versions={versions}
+            version={version}
+            onVersionChange={selectVersion}
+            stats={stats}
+            toolbar={{
+              onShowExcluded: showExcluded,
+              shuffle: shuffleOnExport,
+              onShuffleChange: setShuffleOnExport,
+              onExcel: () => void exportResultsXlsx(),
+              onGift: exportGift,
+              onPrint: printSheet,
+              onExtended: () => void exportPipelineXlsx(),
+              message: exportMsg,
+            }}
+            revalidation={
+              revalidation && setReady && revalidation.available && revalidation.total_count > 0 ? (
+                <RevalidationAccordion
+                  key={`${activeId}:${version}`}
+                  state={revalidation}
+                  versionLabel={
+                    selectedVersionInfo
+                      ? versionOptionLabel(selectedVersionInfo, t)
+                      : t('results:version', { n: version })
+                  }
+                  unsavedCount={unsavedCount}
+                  canStart={expert}
+                  starting={revalidationMutation.isPending}
+                  error={revalidationError}
+                  models={llmModels}
+                  labelModels={allLlmModels}
+                  defaultModelId={dataset.metadata?.validation_model_id}
+                  onStart={(scope, modelId) => revalidationMutation.mutate({ kind: 'start', scope, modelId })}
+                  onRetry={() => revalidationMutation.mutate({ kind: 'retry' })}
+                  onDownloadRun={(runId) => void downloadRevalidationRun(runId)}
+                  downloading={downloadingRun}
                 />
-                <span className="text-slate-500">/ {numPages}</span>
-                <button type="button" className="btn-secondary" disabled={page >= numPages} onClick={() => setPage((p) => p + 1)}>
-                  Next
-                </button>
-              </div>
-            </div>
+              ) : null
+            }
+          />
 
-            {pageQuestions.map((q, i) => {
-              const globalIdx = start + i;
-              const edit = edits[globalIdx] ?? {};
-              const passed = isValidationPassed(q);
+          <QuestionsSection
+            total={filtered.length}
+            totalUnfiltered={questions.length}
+            unsavedCount={unsavedCount}
+            onShowUnsaved={showUnsaved}
+            pendingFilters={pendingFilters}
+            appliedFilters={appliedFilters}
+            chunkOptions={chunkOptions}
+            onPendingFiltersChange={setPendingFilters}
+            onApplyFilters={applyFilters}
+            onResetFilters={resetFilters}
+            page={safePage}
+            totalPages={totalPages}
+            pageSize={pageSize}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+            readOnly={readOnly}
+            lockedMessage={revalidating ? t('results:revalEditingLocked') : null}
+          >
+            {pageItems.map(({ q, index }) => {
+              const qid = String(q.question_id);
+              const state = saveState[qid];
               return (
-                <div key={globalIdx} className="card mb-4">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h4 className="font-medium">
-                      Question {globalIdx + 1}
-                      <span className="ml-2 text-sm font-normal text-slate-500">Chunk {q.chunk_id ?? '—'}</span>
-                    </h4>
-                    {passed != null && (
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${passed ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
-                        {passed ? 'Passed' : 'Failed'}
-                      </span>
-                    )}
-                  </div>
-
-                  {q.source_chunk && (
-                    <details className="mt-2 text-xs">
-                      <summary className="cursor-pointer text-gena-primary">Source text</summary>
-                      <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3">{q.source_chunk}</pre>
-                    </details>
-                  )}
-
-                  {expert ? (
-                    <div className="mt-3 space-y-3">
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <select className="input-field" value={edit.question_type ?? q.question_type ?? 'open'} onChange={(e) => updateEdit(globalIdx, { question_type: e.target.value })}>
-                          {['one', 'multi', 'open'].map((t) => <option key={t} value={t}>{t}</option>)}
-                        </select>
-                        <select className="input-field" value={String(edit.provocativeness ?? q.sensitivity_level ?? q.provocativeness ?? '2')} onChange={(e) => updateEdit(globalIdx, { provocativeness: e.target.value })}>
-                          {['1', '2', '3'].map((t) => <option key={t} value={t}>Sensitivity {levelLabel(t)}</option>)}
-                        </select>
-                        <select className="input-field" value={String(edit.difficulty ?? q.difficulty_level ?? q.difficulty ?? '—')} onChange={(e) => updateEdit(globalIdx, { difficulty: e.target.value === '—' ? null : e.target.value })}>
-                          {['—', '1', '2', '3'].map((t) => <option key={t} value={t}>{t === '—' ? 'Difficulty —' : `Difficulty ${levelLabel(t)}`}</option>)}
-                        </select>
-                      </div>
-                      <textarea className="input-field" rows={3} value={edit.task ?? q.task ?? ''} onChange={(e) => updateEdit(globalIdx, { task: e.target.value })} />
-                      <textarea className="input-field font-mono text-xs" rows={4} value={edit.options != null ? (typeof edit.options === 'string' ? edit.options : asOptionsText(edit.options)) : asOptionsText(q.options)} onChange={(e) => updateEdit(globalIdx, { options: e.target.value })} />
-                      <textarea className="input-field" rows={2} value={edit.correct_answer ?? String(q.correct_answer ?? '')} onChange={(e) => updateEdit(globalIdx, { correct_answer: e.target.value })} />
-                    </div>
-                  ) : (
-                    <div className="mt-2 space-y-1 text-sm">
-                      <p><strong>Type:</strong> {q.question_type}</p>
-                      <p><strong>Task:</strong> {q.task}</p>
-                      <pre className="whitespace-pre-wrap rounded bg-slate-50 p-2">{normOptions(q.options)}</pre>
-                      <p><strong>Answer:</strong> {q.correct_answer}</p>
-                    </div>
-                  )}
-
-                  {(q.validation_passed != null || q.validation_score) && (
-                    <div className="mt-3 text-sm">
-                      <span className={passed ? 'text-emerald-700' : 'text-red-700'}>
-                        Validation: {q.validation_score} (thr: {q.validation_threshold})
-                      </span>
-                      <p className="text-xs text-slate-500">{formatRetryLine(q.retry_count)}</p>
-                      {q.validation_details != null && (
-                        <ul className="mt-1 text-xs text-slate-600">
-                          {formatValidationBreakdown(
-                            parseValidationDetails(q.validation_details),
-                            parseValidationJustifications(q.validation_justifications),
-                          ).map((line, li) => <li key={li}>{line}</li>)}
-                        </ul>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <QuestionCard
+                  key={qid}
+                  question={q}
+                  index={index}
+                  draft={drafts[qid]}
+                  readOnly={readOnly}
+                  editLocked={revalidating}
+                  saving={state?.status === 'saving'}
+                  saved={state?.status === 'saved'}
+                  saveError={state?.status === 'error' ? state.message : null}
+                  exportPending={togglePending.has(qid)}
+                  onDraftChange={(patch) => updateDraft(q, patch)}
+                  onSave={() => {
+                    const draft = drafts[qid];
+                    if (draft) saveMutation.mutate({ q, draft });
+                  }}
+                  onCancel={() => cancelDraft(qid)}
+                  onToggleExport={(included) => toggleMutation.mutate({ q, included })}
+                />
               );
             })}
+          </QuestionsSection>
 
-            {expert && (
-              <div className="space-y-3">
-                <button type="button" className="btn-primary" disabled={saveMutation.isPending || editCount === 0} onClick={() => saveMutation.mutate()}>
-                  {saveMutation.isPending ? 'Saving…' : 'Save Changes as New Version'}
-                </button>
-                {saveMutation.isSuccess && (
-                  <StatusBanner tone="success">Saved as version {saveMutation.data?.new_version}.</StatusBanner>
-                )}
-                {saveMutation.isError && (
-                  <StatusBanner tone="error">
-                    Save failed: {saveMutation.error instanceof Error ? saveMutation.error.message : 'unknown error'}
-                  </StatusBanner>
-                )}
-              </div>
-            )}
-            {!expert && <p className="text-sm text-slate-500">Read-only: editing requires expert role.</p>}
-          </section>
-
-          <section className="mt-8 card">
-            <h2 className="font-semibold">Export</h2>
-            <div className="mt-3 flex flex-wrap gap-3">
-              <button type="button" className="btn-secondary" onClick={() => void exportResultsXlsx()}>Download XLSX (Generation Results)</button>
-              <button type="button" className="btn-secondary" onClick={() => void exportPipelineXlsx()}>Download XLSX (Full Pipeline)</button>
-            </div>
-          </section>
-
-          {versions.length > 1 && (
-            <section className="mt-8 card">
-              <h2 className="font-semibold">Version Comparison</h2>
-              <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                <select className="input-field" value={compareV1 ?? versions[0]?.version ?? ''} onChange={(e) => setCompareV1(parseInt(e.target.value, 10))}>
-                  {versions.map((v) => <option key={v.version} value={v.version}>Version {v.version}</option>)}
-                </select>
-                <select className="input-field" value={compareV2 ?? versions[1]?.version ?? ''} onChange={(e) => setCompareV2(parseInt(e.target.value, 10))}>
-                  {versions.map((v) => <option key={v.version} value={v.version}>Version {v.version}</option>)}
-                </select>
-              </div>
-              <button type="button" className="btn-secondary mt-3" onClick={() => setShowCompare(true)}>Compare Versions</button>
-              {showCompare && compareResult && (
-                <div className="mt-4 space-y-3">
-                  {!compareResult.length ? (
-                    <p className="text-sm text-emerald-700">No differences between selected versions.</p>
-                  ) : (
-                    <>
-                      <p className="text-sm text-slate-600">{compareResult.length} differing question(s)</p>
-                      {compareResult.map((d) => (
-                        <details key={d.qid} className="rounded-lg border border-slate-200 p-3">
-                          <summary className="cursor-pointer font-medium">Question {d.qid}</summary>
-                          <div className="mt-2 space-y-2 text-sm">
-                            {Object.entries(d.diffs).map(([field, [v1, v2]]) => (
-                              <div key={field} className="grid gap-2 sm:grid-cols-2">
-                                <div className="rounded bg-slate-50 p-2"><div className="text-xs text-slate-500">v{compareV1} · {field}</div><pre className="mt-1 whitespace-pre-wrap">{v1 || '—'}</pre></div>
-                                <div className="rounded bg-slate-50 p-2"><div className="text-xs text-slate-500">v{compareV2} · {field}</div><pre className="mt-1 whitespace-pre-wrap">{v2 || '—'}</pre></div>
-                              </div>
-                            ))}
-                          </div>
-                        </details>
-                      ))}
-                    </>
-                  )}
-                </div>
-              )}
-            </section>
-          )}
+          <PrintSheet datasetName={dataset.name} version={version} questions={exportable} />
         </>
       )}
     </div>

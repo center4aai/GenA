@@ -1,20 +1,27 @@
-from typing import Literal, Dict, Optional, TypedDict, List, Union
-from pydantic import BaseModel, Field
+from typing import Literal, Dict, Optional, TypedDict
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import Runnable
-from langchain_core.output_parsers import JsonOutputParser
-import logging
+from langchain_core.output_parsers import PydanticOutputParser
+
 from llm_factory import create_chat_llm
 from agent.nodes.generate_question.system_prompt import (
     PROMPT_TEMPLATE_ONE,
     PROMPT_TEMPLATE_MULTI,
     PROMPT_TEMPLATE_OPEN,
+    PROMPT_TEMPLATE_NO_SOURCE,
     SYSTEM_PROMPT_ONE,
     SYSTEM_PROMPT_MULTI,
     SYSTEM_PROMPT_OPEN,
+    KIND_INSTRUCTIONS,
+    block_instructions_for,
 )
-from langchain_core.output_parsers import PydanticOutputParser
+from agent.schemas.question import StructuredQuestionOutput, fence_user_content
+from agent.llm_parsing import parse_pydantic_output
+from agent.nodes.normalize_output import normalize_question_output
+from agent.document_kinds import normalize_document_kind
 
 try:
     from langdetect import detect, LangDetectException
@@ -27,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 QuestionType = Literal["one", "multi", "open"]
+_SUPPORTED_LANGUAGES = frozenset({"ru", "be", "tg"})
 
 
 class GenerateQuestionInput(TypedDict):
@@ -34,29 +42,19 @@ class GenerateQuestionInput(TypedDict):
     question_type: QuestionType
     source: Optional[str]
     language: Optional[str]  # ru, be, tg
+    document_kind: Optional[str]  # normative | textbook | encyclopedia
+    block_type: Optional[str]  # body | list | inset | caption | glossary_entry
 
 
-class StructuredQuestionOutput(BaseModel):
-    task: str = Field(description="Текст вопроса.")
-    text: Optional[str] = Field(
-        default=None, description="Дополнительный контекст вопроса."
-    )
-    option_1: Optional[str] = Field(default=None, description="Вариант ответа 1.")
-    option_2: Optional[str] = Field(default=None, description="Вариант ответа 2.")
-    option_3: Optional[str] = Field(default=None, description="Вариант ответа 3.")
-    option_4: Optional[str] = Field(default=None, description="Вариант ответа 4.")
-    option_5: Optional[str] = Field(default=None, description="Вариант ответа 5.")
-    option_6: Optional[str] = Field(default=None, description="Вариант ответа 6.")
-    option_7: Optional[str] = Field(default=None, description="Вариант ответа 7.")
-    option_8: Optional[str] = Field(default=None, description="Вариант ответа 8.")
-    option_9: Optional[str] = Field(default=None, description="Вариант ответа 9.")
-    outputs: Union[int, str] = Field(
-        description="Правильный ответ: для типов 'one' - номер варианта (1-9), 'multi' - номера через запятую без пробелов, 'open' - текст ответа."
-    )
-    source_text: Optional[str] = Field(
-        default=None, description="Исходный текст, по которому был сгенерирован вопрос."
-    )
+PROSE_DOCUMENT_KINDS = frozenset({"textbook", "encyclopedia"})
 
+FEW_SHOT_KIND_CAVEAT = (
+    "### ВАЖНО О ПРИМЕРАХ ВЫШЕ\n"
+    "FEW-SHOT примеры выше составлены по нормативным документам, поэтому в них "
+    "есть ссылки на источник («согласно Статье 3 Конституции РФ»). Для текущего "
+    "документа такие ссылки ЗАПРЕЩЕНЫ. Бери из примеров только структуру ответа "
+    "и формат JSON, но НЕ копируй их манеру ссылаться на источник."
+)
 
 def detect_language(text: str) -> str:
     """
@@ -68,6 +66,9 @@ def detect_language(text: str) -> str:
     Returns:
         Код языка: 'ru', 'be', 'tg' или 'ru' по умолчанию
     """
+    if not (text or "").strip():
+        return "ru"
+
     # Сначала проверяем наличие специфических символов таджикского языка
     # Таджикский использует кириллицу с дополнительными символами: ҷ, ҳ, қ, ғ, ӯ, ӣ, ҳ
     tajik_chars = ["ҷ", "ҳ", "қ", "ғ", "ӯ", "ӣ", "Ҷ", "Ҳ", "Қ", "Ғ", "Ӯ", "Ӣ"]
@@ -92,10 +93,27 @@ def detect_language(text: str) -> str:
         )
         return "tg"
 
-    # Проверяем белорусский язык (специфические символы: ў, і, ё)
-    belarusian_chars = ["ў", "Ў"]
-    if any(char in text for char in belarusian_chars):
-        logger.info("Обнаружены белорусские символы, определяем язык как белорусский")
+    # Белорусский: только уникальные маркеры.
+    # НЕ используем ё/Ё (часто в русском) и і/І сами по себе (украинский /
+    # артефакты PDF) — иначе русский учебник ошибочно уходит в be.
+    if any(char in text for char in ("ў", "Ў")):
+        logger.info("Обнаружен белорусский символ ў, определяем язык как белорусский")
+        return "be"
+    belarusian_words = (
+        "беларусь",
+        "беларускі",
+        "беларуская",
+        "беларускай",
+        "мова",
+        "незалежнасць",
+        "рэспубліка беларусь",
+    )
+    has_belarusian_i = any(char in text for char in ("і", "І"))
+    has_belarusian_words = any(w in text.lower() for w in belarusian_words)
+    if has_belarusian_i and has_belarusian_words:
+        logger.info(
+            "Обнаружены белорусские і/І вместе со словарными маркерами, язык=be"
+        )
         return "be"
 
     if detect is None:
@@ -190,7 +208,6 @@ def create_generate_question_chain(
         api_key=api_key,
         temperature=0.0,
         max_tokens=1024,
-        timeout=90,
         **provider_kwargs,
     )
 
@@ -205,12 +222,18 @@ def create_generate_question_chain(
                 logger.info(f"Processing question type: {question_type}")
 
                 # Определение языка
-                language = input_data.get("language")
-                if not language:
+                requested_language = (input_data.get("language") or "").strip().lower()
+                if requested_language in _SUPPORTED_LANGUAGES:
+                    language = requested_language
+                    logger.info(f"Используется явно указанный язык: {language}")
+                else:
+                    if requested_language:
+                        logger.warning(
+                            "Неподдерживаемый язык %r, определяем автоматически",
+                            requested_language,
+                        )
                     language = detect_language(input_data["input_text"])
                     logger.info(f"Язык определен автоматически: {language}")
-                else:
-                    logger.info(f"Используется явно указанный язык: {language}")
 
                 # Дополнительная проверка для таджикского - если в тексте есть таджикские символы, принудительно устанавливаем язык
                 if language != "tg":
@@ -338,6 +361,26 @@ def create_generate_question_chain(
                             + format_instructions
                         )
 
+                # Append document-kind instructions AFTER language rewrites so regex
+                # substitutions above are not disturbed.
+                # Must match the validator and the refiner: grading a question
+                # under kind rules other than the ones used for generation fails it
+                # systematically.
+                document_kind = normalize_document_kind(input_data.get("document_kind"))
+                kind_block = KIND_INSTRUCTIONS.get(document_kind) or ""
+                if kind_block.strip():
+                    system_prompt_base = f"{system_prompt_base}\n\n{kind_block.strip()}"
+                if document_kind in PROSE_DOCUMENT_KINDS:
+                    block_block = block_instructions_for(input_data.get("block_type"))
+                    if block_block:
+                        system_prompt_base = f"{system_prompt_base}\n\n{block_block}"
+                if document_kind in PROSE_DOCUMENT_KINDS:
+                    # The few-shot block above is normative — all three examples
+                    # cite «согласно Статье N Конституции РФ». For a textbook or
+                    # an encyclopedia the model would otherwise see three
+                    # demonstrations of exactly what the rules just forbade.
+                    system_prompt_base = f"{system_prompt_base}\n\n{FEW_SHOT_KIND_CAVEAT}"
+
                 system_prompt = f"{system_prompt_base}\n\n{format_instructions}"
                 source = input_data.get("source", "")
 
@@ -348,9 +391,16 @@ def create_generate_question_chain(
                     "tg": "Муайян нашудааст",
                 }.get(language, "Не указан")
 
+                if document_kind in ("textbook", "encyclopedia"):
+                    prompts = dict(prompts)
+                    prompts["template"] = PROMPT_TEMPLATE_NO_SOURCE
+                    effective_source = (source or "").strip() or "тема и период из заголовка чанка"
+                else:
+                    effective_source = source if source else source_not_specified
+
                 human_prompt = prompts["template"].format(
-                    original_text=input_data["input_text"],
-                    source=source if source else source_not_specified,
+                    original_text=fence_user_content(input_data["input_text"], "SOURCE_TEXT"),
+                    source=effective_source,
                 )
 
                 prompt = ChatPromptTemplate.from_messages(
@@ -360,10 +410,18 @@ def create_generate_question_chain(
                     ]
                 )
 
-                chain = prompt | llm | parser
-                pyd_out = chain.invoke({})
-                out: Dict = pyd_out.model_dump()
+                response = (prompt | llm).invoke({})
+                raw = response.content if hasattr(response, "content") else str(response)
+                try:
+                    pyd_out = parse_pydantic_output(raw, StructuredQuestionOutput)
+                    out: Dict = pyd_out.model_dump()
+                except Exception as parse_err:
+                    logger.warning("Failed to parse generated question: %s", parse_err)
+                    raise ValueError(
+                        "Failed to parse StructuredQuestionOutput from completion"
+                    ) from parse_err
                 out["source_text"] = input_data["input_text"]
+                out = normalize_question_output(out, question_type)
                 logger.info("Successfully generated question")
                 return out
             except Exception as e:

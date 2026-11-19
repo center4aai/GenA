@@ -15,7 +15,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from docx2json_outline import DocumentProcessor, UniversalProcessor
+from docx2json_outline import DocumentProcessor, UniversalProcessor, _is_standalone_article_line
 
 
 # --- 1) Unicode-суперскрипты (¹²³…) ---------------------------------------
@@ -47,6 +47,20 @@ def test_no_collision_with_regular_digits():
     src = "Статья 92"
     assert DocumentProcessor._normalize_unicode_superscripts(src) == src
     assert "(см.сноску" not in DocumentProcessor._normalize_unicode_superscripts(src)
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("Статья 14. Понятие преступления", True),
+        ("Статья 67 (см.сноску 1)", True),
+        ("**Статья 67 (см.сноску 1)**", True),
+        ("Статья 5 другого закона", False),
+        ("см. статью 5 настоящего Кодекса", False),
+    ],
+)
+def test_is_standalone_article_line(line: str, expected: bool):
+    assert _is_standalone_article_line(line) is expected
 
 
 # --- 2) DOCX → Markdown: <sup>N</sup> → (см.сноску N) ---------------------

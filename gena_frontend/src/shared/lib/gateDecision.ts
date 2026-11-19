@@ -19,6 +19,17 @@ export function evaluateGatePass(
   gateResult: GateResult,
   questionTypes: string[],
 ): { passed: boolean; typesOk: string[] } {
+  if (gateResult.rejection_reason === 'gate_disabled_by_pipeline_mode') {
+    return { passed: true, typesOk: [...questionTypes] };
+  }
+  // Stored / synthetic pass (no c1/c2 criteria) — trust passed flag for all types.
+  if (
+    gateResult.passed === true
+    && gateResult.c1_chunk_informative == null
+    && gateResult.c2_chunk_reference_clarity == null
+  ) {
+    return { passed: true, typesOk: [...questionTypes] };
+  }
   const c1 = gateScore(gateResult.c1_chunk_informative);
   const c2 = gateScore(gateResult.c2_chunk_reference_clarity);
   const c3 = gateScore(gateResult.c3_chunk_multi_suitability);
@@ -39,10 +50,16 @@ export function disabledGateResult(): GateResult {
   };
 }
 
-export function gateRejectionSummary(gateResults: Record<number, GateResult>): string {
+export function gateRejectionSummary(
+  gateResults: Record<number, GateResult>,
+  questionTypes?: string[],
+): string {
   const counts: Record<string, number> = {};
   for (const gr of Object.values(gateResults)) {
-    if (!gr.passed) {
+    const failed = questionTypes?.length
+      ? !evaluateGatePass(gr, questionTypes).passed
+      : !gr.passed;
+    if (failed) {
       const reason = gr.rejection_reason ?? 'unknown';
       counts[reason] = (counts[reason] ?? 0) + 1;
     }

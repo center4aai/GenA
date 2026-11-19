@@ -8,14 +8,32 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 _AGENT_API = _REPO / "agent_api"
+if str(_REPO / "tests") not in sys.path:
+    sys.path.insert(0, str(_REPO / "tests"))
 
-if str(_AGENT_API) not in sys.path:
-    sys.path.insert(0, str(_AGENT_API))
+from import_paths import prefer_agent_api
+
+prefer_agent_api()
 
 
 def _install_import_stubs():
-    if find_spec("langgraph") is None:
+    broken_langgraph = False
+    try:
+        # Import for real: the previous check treated "not imported yet" as
+        # "broken" (sys.modules.get returns None), so the stub replaced a
+        # perfectly good langgraph on every run — which is why no test ever
+        # exercised the compiled graph.
+        import langgraph.graph  # noqa: F401
+
+        broken_langgraph = False
+    except Exception:
+        broken_langgraph = True
+    if broken_langgraph:
+        for name in list(sys.modules):
+            if name == "langgraph" or name.startswith("langgraph."):
+                del sys.modules[name]
         langgraph = types.ModuleType("langgraph")
+        langgraph.__spec__ = types.SimpleNamespace(name="langgraph")
         graph = types.ModuleType("langgraph.graph")
         graph.StateGraph = object
         graph.END = "__end__"
@@ -23,10 +41,10 @@ def _install_import_stubs():
         checkpoint = types.ModuleType("langgraph.checkpoint")
         checkpoint_base = types.ModuleType("langgraph.checkpoint.base")
         checkpoint_base.BaseCheckpointSaver = object
-        sys.modules.setdefault("langgraph", langgraph)
-        sys.modules.setdefault("langgraph.graph", graph)
-        sys.modules.setdefault("langgraph.checkpoint", checkpoint)
-        sys.modules.setdefault("langgraph.checkpoint.base", checkpoint_base)
+        sys.modules["langgraph"] = langgraph
+        sys.modules["langgraph.graph"] = graph
+        sys.modules["langgraph.checkpoint"] = checkpoint
+        sys.modules["langgraph.checkpoint.base"] = checkpoint_base
 
     if find_spec("langchain_core") is None:
         langchain_core = types.ModuleType("langchain_core")
@@ -121,5 +139,6 @@ def test_full_mode_refines_failed_validation():
             "pipeline_mode": "full",
             "validation_result": {"passed": False},
             "retry_count": 0,
+            "refine_available": True,
         }
     ) == "refine"

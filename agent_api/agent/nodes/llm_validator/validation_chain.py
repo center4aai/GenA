@@ -16,16 +16,24 @@ class ValidationInput(TypedDict):
     question_type: Literal["open", "one", "multi"]
     source_text: Optional[str]
     question: Dict[str, Any]
+    document_kind: Optional[str]
 
 class ValidationOutput(BaseModel):
     type: str = Field(description="Тип вопроса")
     by_block: Dict[str, list] = Field(description="Оценки по блокам критериев")
+    block_weighted: Dict[str, float] = Field(
+        default_factory=dict, description="Взвешенные баллы по блокам"
+    )
+    block_max: Dict[str, float] = Field(
+        default_factory=dict, description="Максимальные взвешенные баллы по блокам"
+    )
     justifications: Dict[str, list] = Field(default_factory=dict, description="Обоснования оценок по блокам")
     raw: Dict[str, str] = Field(description="Сырые ответы LLM")
     total: float = Field(description="Общий балл")
     max_total: float = Field(description="Максимально возможный балл")
     threshold: float = Field(description="Пороговое значение")
     passed: bool = Field(description="Прошел ли вопрос порог качества")
+    parse_complete: bool = Field(default=True, description="Все критерии успешно распознаны")
 
 def create_validation_chain(
     model_name: str = None,
@@ -58,7 +66,8 @@ def create_validation_chain(
                 result = self.validator.evaluate(
                     qtype=input_data["question_type"],
                     source_text=input_data.get("source_text"),
-                    question=input_data["question"]
+                    question=input_data["question"],
+                    document_kind=input_data.get("document_kind") or "normative",
                 )
                 
                 logger.info(f"Validation completed: score={result['total']}/{result['max_total']}, passed={result['passed']}")

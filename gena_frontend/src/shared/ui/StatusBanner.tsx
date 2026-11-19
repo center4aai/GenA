@@ -1,3 +1,5 @@
+import { useTranslation } from 'react-i18next';
+
 type BannerTone = 'info' | 'success' | 'warning' | 'error';
 
 const toneClasses: Record<BannerTone, string> = {
@@ -8,25 +10,38 @@ const toneClasses: Record<BannerTone, string> = {
 };
 
 export function StatusBanner({ tone, children }: { tone: BannerTone; children: React.ReactNode }) {
+  const isAlert = tone === 'error' || tone === 'warning';
   return (
-    <div className={`rounded-xl border px-4 py-3 text-sm ${toneClasses[tone]}`} role="status">
+    <div
+      className={`rounded-xl border px-4 py-3 text-sm ${toneClasses[tone]}`}
+      role={isAlert ? 'alert' : 'status'}
+      aria-live={isAlert ? 'assertive' : 'polite'}
+    >
       {children}
     </div>
   );
 }
 
-export function LoadingState({ label = 'Loading…' }: { label?: string }) {
+export function LoadingState({ label }: { label?: string }) {
+  const { t } = useTranslation('common');
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-8 text-sm text-slate-500">
-      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gena-primary border-t-transparent" />
-      {label}
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-8 text-sm text-slate-500"
+    >
+      <span
+        aria-hidden="true"
+        className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gena-primary border-t-transparent"
+      />
+      {label ?? t('common:loading')}
     </div>
   );
 }
 
 export function EmptyState({ title, description }: { title: string; description?: string }) {
   return (
-    <div className="card text-center">
+    <div className="card text-center" role="status">
       <p className="font-medium text-slate-800">{title}</p>
       {description && <p className="mt-1 text-sm text-slate-500">{description}</p>}
     </div>

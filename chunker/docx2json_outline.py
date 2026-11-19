@@ -46,6 +46,34 @@ def _strip_md_emphasis(s: str) -> str:
         s2 = (m.group(2).strip() + ' ' + m.group(3).strip()).strip()
     return s2
 
+_ARTICLE_LINE_HEADING_RE = re.compile(
+    r'^(?:Статья|Article)\s+(\d+)([\.:])?(?:[ \t]+(.*))?$',
+    re.IGNORECASE,
+)
+# Сноска после номера статьи: «Статья 67 (см.сноску 1)» — отдельный заголовок, не ссылка в тексте.
+_ARTICLE_FOOTNOTE_SUFFIX_RE = re.compile(
+    r'^\(см\.сноску\s+\d+\)$',
+    re.IGNORECASE,
+)
+
+def _is_standalone_article_line(line: str) -> bool:
+    """True if a whole line is a legal article heading, not an in-text reference.
+
+    «Статья 14. Понятие преступления» → heading; «Статья 5 другого закона» → reference.
+    «Статья 67 (см.сноску 1)» → heading (PDF/DOCX сноска, не склейка «Статья 671»).
+    """
+    s = _strip_md_emphasis(line.strip())
+    m = _ARTICLE_LINE_HEADING_RE.match(s)
+    if not m:
+        return False
+    punct, rest = m.group(2), m.group(3)
+    if rest:
+        rest_stripped = rest.strip()
+        if _ARTICLE_FOOTNOTE_SUFFIX_RE.match(rest_stripped):
+            return True
+        return bool(rest[0].isupper() or rest[0].isdigit())
+    return True
+
 def _iter_markdown_blocks(md: str):
     """Итератор по блокам markdown, сохраняющий ссылки в формате [текст](url)"""
     lines = md.splitlines(); i=0; n=len(lines)
@@ -72,9 +100,14 @@ def _iter_markdown_blocks(md: str):
         yield ("para", para_text)
         while i<n and lines[i].strip()=="": i+=1
 
-def parse_markdown_to_tree(md: str) -> Dict[str,Any]:
+def parse_markdown_to_tree(md: str, legal_postprocess: bool = True) -> Dict[str,Any]:
     """node = {'level':int,'title':str,'content':str,'children':[node,...]}
-    Сохраняет ссылки в формате [текст](url) в content и title"""
+    Сохраняет ссылки в формате [текст](url) в content и title.
+
+    legal_postprocess=False skips article / numbered-item surgery used for
+    normative (Garant/Consultant) docs — school textbooks must not be shredded
+    by a stray «Статья N» quote or birth-death years like «1907) — …».
+    """
     root={"level":0,"title":"","content":"","children":[]}
     stack=[root]; pending=[]
     def attach():
@@ -96,16 +129,17 @@ def parse_markdown_to_tree(md: str) -> Dict[str,Any]:
     
     # Постобработка: объединяем узлы с одинаковым уровнем, если они являются последовательными параграфами
     tree = _merge_sequential_paragraphs(root)
-    
-    # Постобработка: разбиваем content корневого узла на статьи, если они там есть
-    tree = _split_content_into_articles(tree)
-    
-    # Постобработка: объединяем пункты под заголовками статей/разделов
-    tree = _attach_items_to_headings(tree)
-    
-    # Постобработка: разбиваем подпункты в content на отдельные узлы
-    tree = _split_sub_items_in_content(tree)
-    
+
+    if legal_postprocess:
+        # Постобработка: разбиваем content корневого узла на статьи, если они там есть
+        tree = _split_content_into_articles(tree)
+
+        # Постобработка: объединяем пункты под заголовками статей/разделов
+        tree = _attach_items_to_headings(tree)
+
+        # Постобработка: разбиваем подпункты в content на отдельные узлы
+        tree = _split_sub_items_in_content(tree)
+
     # Постобработка: удаляем пустые промежуточные узлы
     tree = _remove_empty_intermediate_nodes(tree)
     
@@ -734,87 +768,47 @@ def _extract_numbered_items_from_content(content: str) -> List[Dict[str,Any]]:
     return items
 
 def _split_content_into_articles(node: Dict[str,Any]) -> Dict[str,Any]:
-    """Разбивает content корневого узла на статьи, если они там есть"""
-    # Обрабатываем только корневой узел (level 0) с пустым title
-    if node.get("level", 0) != 0 or node.get("title", "").strip():
-        # Рекурсивно обрабатываем дочерние элементы
-        if node.get("children"):
-            node["children"] = [_split_content_into_articles(ch) for ch in node["children"]]
-        return node
-    
+    """Разбивает content узла на статьи, если они там есть (fallback после markdown)."""
     content = node.get("content", "").strip()
-    if not content:
-        # Рекурсивно обрабатываем дочерние элементы
-        if node.get("children"):
-            node["children"] = [_split_content_into_articles(ch) for ch in node["children"]]
-        return node
-    
-    # Ищем паттерны "Статья X" в content
-    # Паттерн: начало строки или два переноса строки, затем "Статья" + пробел + цифра, затем один или два переноса строки
-    # Учитываем разные варианты: "\n\nСтатья 1\n\n", "\nСтатья 1\n", "^Статья 1\n" (в начале)
-    article_pattern = re.compile(r'(?:^|\n\n|\n)(Статья\s+\d+)\s*(?:\n\n|\n|$)', re.MULTILINE | re.IGNORECASE)
-    
-    # Находим все совпадения
-    matches = list(article_pattern.finditer(content))
-    
-    if not matches:
-        # Если не нашли статьи в content, рекурсивно обрабатываем дочерние элементы
-        if node.get("children"):
-            node["children"] = [_split_content_into_articles(ch) for ch in node["children"]]
-        return node
-    
-    # Разбиваем content на части
-    extracted_articles = []
-    remaining_content_parts = []
-    
-    # Текст до первой статьи
-    first_match = matches[0]
-    text_before = content[:first_match.start()].strip()
-    if text_before:
-        remaining_content_parts.append(text_before)
-    
-    # Обрабатываем каждую статью
-    for i, match in enumerate(matches):
-        article_title = match.group(1)  # "Статья X"
-        
-        # Определяем начало content статьи (после "Статья X" и переносов строк)
-        article_start = match.end()
-        # Пропускаем пробелы и переносы строк после "Статья X"
-        while article_start < len(content) and content[article_start] in ['\n', ' ', '\t']:
-            article_start += 1
-        
-        # Конец статьи - это начало следующей статьи или конец content
-        if i + 1 < len(matches):
-            next_match = matches[i + 1]
-            article_end = next_match.start()
-        else:
-            article_end = len(content)
-        
-        article_content = content[article_start:article_end].strip()
-        
-        # Создаем узел для статьи
-        article_node = {
-            "level": 2,  # Уровень статьи
-            "title": article_title,
-            "content": article_content,
-            "children": []
-        }
-        extracted_articles.append(article_node)
-    
-    # Обновляем корневой узел
-    if remaining_content_parts:
-        node["content"] = "\n\n".join(remaining_content_parts)
-    else:
-        node["content"] = ""
-    
-    # Вставляем извлеченные статьи в начало children
-    existing_children = node.get("children", [])
-    node["children"] = extracted_articles + existing_children
-    
-    # Рекурсивно обрабатываем все дочерние элементы (включая только что созданные статьи)
+    if content:
+        # «Статья 14.» / «Статья 14. Заголовок» — в т.ч. без отдельного markdown-заголовка
+        article_pattern = re.compile(
+            r'(?:^|\n\n|\n)((?:Статья|Article)\s+\d+[^\n]*)',
+            re.MULTILINE | re.IGNORECASE,
+        )
+        matches = [
+            m for m in article_pattern.finditer(content)
+            if _is_standalone_article_line(m.group(1))
+        ]
+        if matches:
+            extracted_articles = []
+            remaining_content_parts = []
+            child_level = node.get("level", 0) + 1
+
+            first_match = matches[0]
+            text_before = content[:first_match.start()].strip()
+            if text_before:
+                remaining_content_parts.append(text_before)
+
+            for i, match in enumerate(matches):
+                article_title = _strip_md_emphasis(match.group(1).strip())
+                article_start = match.end()
+                while article_start < len(content) and content[article_start] in ('\n', ' ', '\t'):
+                    article_start += 1
+                article_end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+                article_content = content[article_start:article_end].strip()
+                extracted_articles.append({
+                    "level": child_level,
+                    "title": article_title,
+                    "content": article_content,
+                    "children": [],
+                })
+
+            node["content"] = "\n\n".join(remaining_content_parts) if remaining_content_parts else ""
+            node["children"] = extracted_articles + node.get("children", [])
+
     if node.get("children"):
         node["children"] = [_split_content_into_articles(ch) for ch in node["children"]]
-    
     return node
 
 def _split_sub_items_in_content(node: Dict[str,Any]) -> Dict[str,Any]:
@@ -1323,6 +1317,16 @@ def clean_tree_with_patterns(node: Dict[str, Any], patterns: List[Dict[str, str]
 class DocumentProcessor(ABC):
     """Базовый класс для обработчиков документов"""
     
+    def cached_markdown(self, path: str) -> str:
+        cache = getattr(self, "_instance_markdown_cache", None)
+        if cache is None:
+            cache = {}
+            self._instance_markdown_cache = cache
+        key = str(Path(path).resolve())
+        if key not in cache:
+            cache[key] = self.convert_to_markdown(key)
+        return cache[key]
+    
     @abstractmethod
     def can_process(self, path: str) -> bool:
         """Проверяет, может ли обработчик обработать данный документ"""
@@ -1335,20 +1339,35 @@ class DocumentProcessor(ABC):
     
     _UNICODE_SUP_TRANS = str.maketrans('⁰¹²³⁴⁵⁶⁷⁸⁹', '0123456789')
 
-    def convert_to_markdown(self, path: str) -> str:
+    def convert_to_markdown(self, path: str, apply_pdf_footnotes: bool = True) -> str:
         """Универсальный метод преобразования в markdown через markitdown.
         Для DOCX — вызывает mammoth напрямую, чтобы сохранить суперскрипт-сноски.
         Для PDF — после markitdown отдельно «вытаскивает» суперскрипт-сноски через
         pdfplumber (markitdown теряет инфу о размере шрифта, и сноска ¹ приклеивается
-        к номеру: «Статья 67¹» → «Статья 671»)."""
+        к номеру: «Статья 67¹» → «Статья 671»).
+
+        apply_pdf_footnotes=False ускоряет большие учебники (сноски правового
+        формата там обычно не нужны).
+        """
         if path.lower().endswith('.docx'):
             return self._docx_to_markdown_with_footnotes(path)
         md_obj = MarkItDown(enable_plugins=False)
         res = md_obj.convert(path)
         text = self._normalize_unicode_superscripts((res.text_content or "").strip())
-        if path.lower().endswith('.pdf'):
+        if path.lower().endswith('.pdf') and apply_pdf_footnotes:
             try:
-                text = self._apply_pdf_superscript_footnotes(path, text)
+                # Полный pdfplumber-проход по сноскам дорог на больших учебниках.
+                # Для документов >80 стр. пропускаем — markitdown + unicode-sup уже хватает.
+                import pdfplumber
+                with pdfplumber.open(path) as _pdf:
+                    n_pages = len(_pdf.pages)
+                if n_pages > 80:
+                    logger.info(
+                        "Skipping PDF superscript footnote pass for large document "
+                        f"({n_pages} pages)"
+                    )
+                else:
+                    text = self._apply_pdf_superscript_footnotes(path, text)
             except Exception as e:
                 # PDF-фолбэк не должен ломать общий пайплайн.
                 logger.warning(f"PDF superscript post-processing failed: {e}")
@@ -1371,12 +1390,21 @@ class DocumentProcessor(ABC):
 
     @staticmethod
     def _normalize_unicode_superscripts(text: str) -> str:
-        """Заменяет Unicode-суперскрипт-цифры (¹²³…) на (см.сноску N)."""
-        return re.sub(
-            r'[⁰¹²³⁴⁵⁶⁷⁸⁹]+',
-            lambda m: f' (см.сноску {m.group().translate(DocumentProcessor._UNICODE_SUP_TRANS)})',
-            text,
-        )
+        """Заменяет Unicode-суперскрипт-цифры (¹²³…) на (см.сноску N).
+
+        Кроме единиц измерения: «км²», «м³», «см²» — там ² и ³ это степень, а не
+        сноска. Раньше «площадь 17 125 191 км²» превращалась в «км (см.сноску 2)»,
+        и вопрос уходил в генерацию с искажённой единицей.
+        """
+
+        def _replace(m: "re.Match") -> str:
+            sup = m.group()
+            prev = text[m.start() - 1] if m.start() else ""
+            if sup in ("²", "³") and prev.isalpha():
+                return sup
+            return f' (см.сноску {sup.translate(DocumentProcessor._UNICODE_SUP_TRANS)})'
+
+        return re.sub(r'[⁰¹²³⁴⁵⁶⁷⁸⁹]+', _replace, text)
 
     # --- PDF-сноски (суперскрипты, которые markitdown «склеивает» как обычные цифры) ---
 
@@ -1506,17 +1534,14 @@ class GarantProcessor(DocumentProcessor):
     def can_process(self, path: str) -> bool:
         """Определяет документы Гаранта по характерным признакам"""
         try:
-            # Проверяем содержимое документа
-            md = self.convert_to_markdown(path)
-            # Характерные признаки документов Гаранта:
-            # - наличие "ГАРАНТ:" в тексте
-            # - наличие ссылок на ivo.garant.ru
-            # - структура "Глава X", "Статья X"
-            has_garant_marker = "ГАРАНТ:" in md or "ГАРАНТ" in md
+            md = self.cached_markdown(path)
+            has_garant_marker = bool(re.search(r'^\s*ГАРАНТ\s*:', md, re.MULTILINE | re.IGNORECASE))
             has_garant_links = "ivo.garant.ru" in md or "garant.ru" in md
-            has_legal_structure = bool(re.search(r'Глава\s+\d+|Статья\s+\d+', md))
+            has_chapters = bool(re.search(r'Глава\s+\d+', md, re.IGNORECASE))
+            has_articles = bool(re.search(r'Статья\s+\d+', md, re.IGNORECASE))
+            has_legal_structure = has_chapters and has_articles
             return has_garant_marker or (has_garant_links and has_legal_structure)
-        except:
+        except Exception:
             return False
     
     def _clean_garant_text(self, text: str) -> str:
@@ -1568,7 +1593,7 @@ class GarantProcessor(DocumentProcessor):
     
     def process(self, path: str) -> Dict[str,Any]:
         """Обрабатывает документ Гаранта"""
-        md = self.convert_to_markdown(path)
+        md = self.cached_markdown(path)
         
         # Очищаем от служебных строк ГАРАНТ перед обработкой
         md = self._clean_garant_text(md)
@@ -1582,7 +1607,6 @@ class GarantProcessor(DocumentProcessor):
         # (например, "**Статья 14.** Понятие преступления") — поэтому проверяем
         # после _strip_md_emphasis(), а в выходной заголовок пишем уже очищенную строку.
         chapter_pattern = re.compile(r'^(Глава\s+\d+[\.:]?\s*.+?)$', re.IGNORECASE)
-        article_pattern = re.compile(r'^(Статья\s+\d+[\.:]?\s*.+?)$', re.IGNORECASE)
 
         # Преобразуем в заголовки markdown
         lines = md.splitlines()
@@ -1597,7 +1621,7 @@ class GarantProcessor(DocumentProcessor):
                 i += 1
                 continue
             # Проверяем на статью
-            if article_pattern.match(stripped):
+            if _is_standalone_article_line(stripped):
                 processed_lines.append(f"## {stripped}")
                 i += 1
                 continue
@@ -1623,20 +1647,21 @@ class ConsultantProcessor(DocumentProcessor):
     def can_process(self, path: str) -> bool:
         """Определяет документы Консультанта по характерным признакам"""
         try:
-            md = self.convert_to_markdown(path)
-            # Характерные признаки документов Консультанта:
-            # - наличие ссылок на consultant.ru
-            # - наличие "КонсультантПлюс" в тексте
-            # - структура с разделами, главами, статьями и подразделами
-            has_consultant_links = "consultant.ru" in md or "КонсультантПлюс" in md or "Консультант" in md
-            has_sections = bool(re.search(r'Раздел\s+\d+|Подраздел\s+\d+|Глава\s+\d+|Статья\s+\d+', md, re.IGNORECASE))
-            return has_consultant_links or has_sections
-        except:
+            md = self.cached_markdown(path)
+            has_consultant_links = (
+                "consultant.ru" in md
+                or "КонсультантПлюс" in md
+            )
+            has_article_structure = bool(
+                re.search(r'Статья\s+\d+', md, re.IGNORECASE)
+            )
+            return has_consultant_links and has_article_structure
+        except Exception:
             return False
     
     def process(self, path: str) -> Dict[str,Any]:
         """Обрабатывает документ Консультанта"""
-        md = self.convert_to_markdown(path)
+        md = self.cached_markdown(path)
         
         # Дополнительная обработка для документов Консультанта:
         # - Улучшаем распознавание разделов с римскими цифрами
@@ -1652,8 +1677,6 @@ class ConsultantProcessor(DocumentProcessor):
         subsection_pattern = re.compile(r'^(Подраздел\s+\d+[\.:]?\s*.+)$', re.IGNORECASE)
         # Глава с номером: "Глава 1", "Глава 2" и т.д. (может быть с точкой или без)
         chapter_pattern = re.compile(r'^(Глава\s+\d+[\.:]?\s*.+)$', re.IGNORECASE)
-        # Статья с номером: "Статья 1", "Статья 2" и т.д. (может быть с точкой или без)
-        article_pattern = re.compile(r'^(Статья\s+\d+[\.:]?\s*.+)$', re.IGNORECASE)
         # Римские цифры с точкой: I., II., III., IV., V.
         roman_section_pattern = re.compile(r'^([IVXLCDM]+)\.\s+(.+)$', re.IGNORECASE)
         # Подзаголовки (начинаются с заглавной буквы, короткие, без точки в конце)
@@ -1694,7 +1717,7 @@ class ConsultantProcessor(DocumentProcessor):
                 while j < len(lines):
                     next_line = _strip_md_emphasis(lines[j].strip())
                     # Если следующая строка пустая или начинается с "Статья" или "Глава" - прекращаем
-                    if not next_line or article_pattern.match(next_line) or chapter_pattern.match(next_line):
+                    if not next_line or _is_standalone_article_line(next_line) or chapter_pattern.match(next_line):
                         break
                     # Если следующая строка - таблица или другой заголовок - прекращаем
                     if next_line.startswith('|') or section_pattern.match(next_line) or subsection_pattern.match(next_line):
@@ -1710,7 +1733,7 @@ class ConsultantProcessor(DocumentProcessor):
                 continue
             
             # Проверяем на Статью
-            if article_pattern.match(line):
+            if _is_standalone_article_line(line):
                 processed_lines.append(f"## {line}")
                 i += 1
                 continue
@@ -1742,7 +1765,7 @@ class ConsultantProcessor(DocumentProcessor):
                        section_pattern.match(next_line) or
                        subsection_pattern.match(next_line) or
                        chapter_pattern.match(next_line) or
-                       article_pattern.match(next_line)):
+                       _is_standalone_article_line(next_line)):
                     processed_lines.append(f"## {line}")
                     i += 1
                     continue
@@ -2064,7 +2087,636 @@ class GOSTProcessor(DocumentProcessor):
         tree = parse_markdown_to_tree(md_processed)
         return self.apply_cleaning_patterns(tree)
 
-# ---------- 8) Универсальный обработчик для прочих документов ----------
+# ---------- 8) Обработчик школьных учебников ----------
+
+_TEXTBOOK_CHAPTER_RE = re.compile(
+    r'^(?:Глава|ГЛАВА)\s+([IVXLCDM]+|\d+)\.?\s*(.*)$',
+    re.IGNORECASE,
+)
+# Bare «§ 1» / «§ 2–3» (title on following lines) or single-line «§ 1. Title»
+# Optional leading page number glued to §: «19§ 2–3. …»
+_TEXTBOOK_SECTION_BARE_RE = re.compile(
+    r'^(?:\d{1,3})?§\s*(\d+(?:\s*[–—\-]\s*\d+)?)\s*$',
+)
+_TEXTBOOK_SECTION_FULL_RE = re.compile(
+    r'^(?:\d{1,3})?§\s*(\d+(?:\s*[–—\-]\s*\d+)?)\.\s+(.+)$',
+)
+_TEXTBOOK_ALLCAPS_SUBHEAD_RE = re.compile(
+    r'^[А-ЯЁA-Z0-9][А-ЯЁA-Z0-9\s\-–—«»""]{2,80}$',
+)
+_TEXTBOOK_KNOWN_SUBHEADS = frozenset({
+    "КЛЮЧЕВЫЕ ПОНЯТИЯ",
+    "ВСПОМНИТЕ",
+    "ПРОВЕРЯЕМ СЕБЯ",
+    "ЗАГАДКА ЧЕЛОВЕКА",
+    "ПОДВЕДЁМ ИТОГИ",
+    "ПОДВЕДЕМ ИТОГИ",
+    "ВОПРОСЫ И ЗАДАНИЯ",
+    "ДЛЯ ЛЮБОЗНАТЕЛЬНЫХ",
+    "ЭТО ИНТЕРЕСНО",
+    "РАБОТАЕМ С ИСТОЧНИКОМ",
+    "ПРАКТИКУМ",
+})
+_TEXTBOOK_PAGE_NUM_RE = re.compile(r'^\d{1,3}$')
+_TEXTBOOK_PRINT_MARK_RE = re.compile(r'^[0-9A-Fa-f]{4,8}$')
+_TEXTBOOK_INDESIGN_RE = re.compile(r'\.indd\b', re.IGNORECASE)
+_TEXTBOOK_UDK_RE = re.compile(r'^(УДК|ББК|ISBN)\b', re.IGNORECASE)
+_TEXTBOOK_CID_BULLET_RE = re.compile(r'\(cid:\s*\d+\)', re.IGNORECASE)
+# Soft hyphen at line break; tolerate whitespace before the hyphen (БРЭ / Medinsky).
+_TEXTBOOK_HYPHEN_JOIN_RE = re.compile(
+    r'([А-Яа-яЁёA-Za-z])[ \t]*-[ \t]*\n[ \t]*([а-яёa-z])',
+)
+# ALL-CAPS headword continuation across a soft hyphen (encyclopedia entries).
+_CAPS_HYPHEN_JOIN_RE = re.compile(
+    r'([А-ЯЁ])[ \t]*-[ \t]*\n[ \t]*([А-ЯЁ]{2,})',
+)
+# Строка, оборванная переносом, и строка-продолжение со строчной буквы.
+_TEXTBOOK_TRAILING_HYPHEN_RE = re.compile(r'([А-Яа-яЁёA-Za-z])[ \t]*-[ \t]*$')
+_TEXTBOOK_LOWER_START_RE = re.compile(r'^[а-яёa-z]')
+# Stress marks decoded as digit 2/9 mid-word (ПУТОР2АКИ → ПУТОРАКИ).
+# Two rules so "В 2АВСТРИИ" keeps the space (→ "В АВСТРИИ", not "ВАВСТРИИ").
+_STRESS_DIGIT_RE = re.compile(r'([А-ЯЁа-яё])([29])(?=[А-ЯЁа-яё])')
+# The stress mark is sometimes emitted with a space in front of it («МАШ 2ИНЫ»
+# for МАШИ́НЫ). Dropping only the digit left «МАШ ИНЫ» — a headword torn in two.
+# The space goes with the digit, unless what precedes it is a standalone short
+# word: «В 2ИТАЛИИ», «ДИ 2КОЗИМО» are real word boundaries, not kerning.
+_STRESS_DIGIT_SP_RE = re.compile(
+    r'(?<![А-ЯЁа-яё])([А-ЯЁа-яё]{3,}) ([29])(?=[А-ЯЁа-яё])'
+)
+# Whatever the rule above deliberately skipped (a genuine word boundary such as
+# «В 2ИТАЛИИ») still has to lose the digit — just not the space, or two words
+# would be welded together.
+_STRESS_DIGIT_SP_KEEP_RE = re.compile(r'([А-ЯЁа-яё] )([29])(?=[А-ЯЁа-яё])')
+
+
+_TEXTBOOK_TABLE_MARKS_RE = re.compile(r'\s*\|\s*|\s*-{3,}\s*')
+
+
+def _textbook_norm_ws(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or "").replace('\xa0', ' ')).strip()
+
+
+def _textbook_heading_text(s: str) -> str:
+    """Текст заголовка: markitdown может превратить строку заголовка в строку
+    таблицы («§ 18. | | Хозяйственная | | система | --- |») — черты и отточия
+    убираем. Только для заголовков: в теле такие строки — таблицы, их
+    выбрасывает чанкер."""
+    return _textbook_norm_ws(_TEXTBOOK_TABLE_MARKS_RE.sub(' ', s or ""))
+
+
+def _textbook_norm_heading_key(s: str) -> str:
+    """Normalize heading text for running-header dedup comparisons."""
+    s = _textbook_norm_ws(s)
+    s = re.sub(r'^(?:\d{1,3})?(§|Глава|ГЛАВА)\s*', lambda m: m.group(1).upper() + ' ', s, flags=re.I)
+    s = s.replace('–', '-').replace('—', '-')
+    return s.casefold()
+
+
+def _textbook_is_allcaps_subhead(line: str) -> bool:
+    s = _textbook_norm_ws(line)
+    if not s or len(s) > 80:
+        return False
+    compact = s.upper().replace('Ё', 'Е')
+    if compact in _TEXTBOOK_KNOWN_SUBHEADS:
+        return True
+    if not _TEXTBOOK_ALLCAPS_SUBHEAD_RE.match(s):
+        return False
+    # Skip list-like / prose-like lines promoted by PDF all-caps styling
+    if any(ch in s for ch in ',;:·•') or s.endswith(('.', '!', '?')):
+        return False
+    letters = [c for c in s if c.isalpha()]
+    if len(letters) < 4:
+        return False
+    upper = sum(1 for c in letters if c.isupper())
+    # Strict: essentially fully uppercase short heading
+    return upper == len(letters) and 4 <= len(s) <= 60
+
+
+def _textbook_is_junk_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if _TEXTBOOK_PAGE_NUM_RE.match(s):
+        return True
+    if _TEXTBOOK_PRINT_MARK_RE.match(s):
+        return True
+    if _TEXTBOOK_INDESIGN_RE.search(s):
+        return True
+    if _TEXTBOOK_UDK_RE.match(s):
+        return True
+    low = s.casefold()
+    if low.startswith('исключительные права'):
+        return True
+    if 'shutterstock' in low or 'fotodom' in low:
+        return True
+    if low.startswith('в оформлении обложки'):
+        return True
+    if re.match(r'^[оo]-?\d{1,3}$', low):  # ББК shelf code like О-28
+        return True
+    return False
+
+
+def _textbook_strip_cover_letter_runs(lines: List[str]) -> List[str]:
+    """Drop runs of single-character lines typical of vertical cover titles."""
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if len(s) == 1 and s.isalpha():
+            j = i
+            while j < n and len(lines[j].strip()) <= 1 and (
+                not lines[j].strip() or lines[j].strip().isalpha()
+            ):
+                j += 1
+            alpha_count = sum(1 for k in range(i, j) if len(lines[k].strip()) == 1)
+            if alpha_count >= 4:
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def _strip_stress_digits(md: str) -> str:
+    """Remove OCR-style stress digits (2/9) embedded between Cyrillic letters."""
+    md = _STRESS_DIGIT_RE.sub(r'\1', md)
+    # Note the replacement drops the space as well — see _STRESS_DIGIT_SP_RE.
+    md = _STRESS_DIGIT_SP_RE.sub(r'\1', md)
+    md = _STRESS_DIGIT_SP_KEEP_RE.sub(r'\1', md)
+    return md
+
+
+def _textbook_join_hyphen_across_headers(text: str) -> str:
+    """Склеить слово, разорванное переносом и вклинившимся колонтитулом.
+
+    «правитель-» / «§ 2-3. Как устроено общество 19» / «ства)»: заголовок посреди
+    слова — всегда колонтитул страницы, поэтому его выбрасываем. Иначе он рвёт
+    и слово, и абзац, а обломок уезжает в отдельный чанк.
+    """
+    lines = text.splitlines()
+    out: List[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        continuation = -1
+        if _TEXTBOOK_TRAILING_HYPHEN_RE.search(line):
+            skipped, j = 0, i + 1
+            while j < n and skipped <= 2:
+                nxt = lines[j].strip()
+                if nxt:
+                    if _TEXTBOOK_LOWER_START_RE.match(nxt):
+                        continuation = j
+                        break
+                    skipped += 1
+                j += 1
+        if continuation >= 0:
+            out.append(
+                _TEXTBOOK_TRAILING_HYPHEN_RE.sub(r'\1', line) + lines[continuation].strip()
+            )
+            i = continuation + 1
+        else:
+            out.append(line)
+            i += 1
+    return "\n".join(out)
+
+
+def _textbook_cleanup_text(md: str) -> str:
+    """De-hyphenate, normalize spaces/bullets, drop junk lines."""
+    # Join hyphenated line breaks before other processing
+    md = _CAPS_HYPHEN_JOIN_RE.sub(r'\1\2', md)
+    md = _TEXTBOOK_HYPHEN_JOIN_RE.sub(r'\1\2', md)
+    md = _strip_stress_digits(md)
+    md = md.replace('\xa0', ' ')
+    md = _TEXTBOOK_CID_BULLET_RE.sub('•', md)
+    lines = md.splitlines()
+    lines = _textbook_strip_cover_letter_runs(lines)
+    cleaned: List[str] = []
+    for line in lines:
+        raw = line
+        s = line.strip()
+        if _textbook_is_junk_line(s):
+            continue
+        # Collapse justification double spaces inside the line
+        s = re.sub(r' {2,}', ' ', s)
+        cleaned.append(s if s else "")
+    # Collapse 3+ blank lines
+    text = "\n".join(cleaned)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Повторная склейка: перенос через номер страницы или колонтитул становится
+    # видимым только после удаления мусорных строк.
+    text = _CAPS_HYPHEN_JOIN_RE.sub(r'\1\2', text)
+    text = _TEXTBOOK_HYPHEN_JOIN_RE.sub(r'\1\2', text)
+    text = _textbook_join_hyphen_across_headers(text)
+    return text.strip()
+
+
+# Колонтитул страницы учебника, украшенный номером страницы: «8 ГЛАВА I»,
+# «ГЛАВА I 9», «7 § 1. Восстановление…», «§ 1. Восстановление… 7». Без номера
+# это обычный заголовок главы/параграфа, который дедупится ниже.
+_TEXTBOOK_RUNNING_HEADER_RES = (
+    re.compile(r'^(?P<page>\d{1,3})\s+(?P<core>(?:Глава|ГЛАВА)\s+(?:[IVXLCDM]+|\d+)\.?)$'),
+    re.compile(r'^(?P<core>(?:Глава|ГЛАВА)\s+(?:[IVXLCDM]+|\d+)\.?)\s+(?P<page>\d{1,3})$'),
+    re.compile(r'^(?P<page>\d{1,3})\s+(?P<core>§\s*\d+(?:\s*[–—\-]\s*\d+)?\.\s+\S.{2,120}?)$'),
+    re.compile(r'^(?P<core>§\s*\d+(?:\s*[–—\-]\s*\d+)?\.\s+\S.{2,120}?)\s+(?P<page>\d{1,3})$'),
+)
+# Повтор ключа на стольких страницах делает строку колонтитулом (а не, скажем,
+# заголовком «Глава I. 1945», который встречается один раз).
+_TEXTBOOK_RUNNING_HEADER_MIN_REPEATS = 2
+
+
+def _textbook_running_header_core(line: str) -> Optional[str]:
+    """«8 ГЛАВА I» → «ГЛАВА I»; не колонтитул → None."""
+    s = line.strip()
+    for rx in _TEXTBOOK_RUNNING_HEADER_RES:
+        m = rx.match(s)
+        if m:
+            return m.group("core").strip()
+    return None
+
+
+def _textbook_running_header_keys(lines: List[str]) -> Dict[str, int]:
+    """Сколько раз каждый колонтитул (без номера страницы) встречается в тексте."""
+    counts: Dict[str, int] = {}
+    for line in lines:
+        core = _textbook_running_header_core(line)
+        if core:
+            key = _textbook_norm_heading_key(core)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _textbook_strip_running_header_page(line: str, header_keys: Dict[str, int]) -> str:
+    """Убрать номер страницы из колонтитула, если тот повторяется по документу.
+
+    Остаётся чистый «ГЛАВА I» / «§ 1. Название», который ниже превращается в
+    заголовок и дедупится по номеру главы/параграфа. Иначе «8 ГЛАВА I» проходил
+    как КАПС-подзаголовок, и каждая страница становилась узлом дерева.
+    """
+    core = _textbook_running_header_core(line)
+    if not core:
+        return line
+    if header_keys.get(_textbook_norm_heading_key(core), 0) < _TEXTBOOK_RUNNING_HEADER_MIN_REPEATS:
+        return line
+    return core
+
+
+def _textbook_rewrite_headings(md: str) -> str:
+    """Inject ATX headings for chapters/§/all-caps subheads; drop running headers."""
+    lines = md.splitlines()
+    header_keys = _textbook_running_header_keys(lines)
+    lines = [_textbook_strip_running_header_page(l, header_keys) for l in lines]
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    open_chapter_key = ""
+    open_section_key = ""
+
+    def _peek_nonempty(start: int) -> Tuple[int, str]:
+        j = start
+        while j < n and not lines[j].strip():
+            j += 1
+        if j >= n:
+            return j, ""
+        return j, lines[j].strip()
+
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+        if not s:
+            out.append("")
+            i += 1
+            continue
+
+        # Chapter: «Глава I. …» / «ГЛАВА I»
+        ch = _TEXTBOOK_CHAPTER_RE.match(s)
+        if ch:
+            num, rest = ch.group(1), (ch.group(2) or "").strip()
+            title = _textbook_heading_text(f"Глава {num}" + (f". {rest}" if rest else ""))
+            # Absorb one wrapped ALL-CAPS continuation (e.g. «И ОКРУЖАЮЩИЙ МИР»)
+            j, nxt = _peek_nonempty(i + 1)
+            if (
+                nxt
+                and _textbook_is_allcaps_subhead(nxt)
+                and nxt.upper().replace('Ё', 'Е') not in _TEXTBOOK_KNOWN_SUBHEADS
+                and not _TEXTBOOK_CHAPTER_RE.match(nxt)
+                and not _TEXTBOOK_SECTION_BARE_RE.match(nxt)
+                and not _TEXTBOOK_SECTION_FULL_RE.match(nxt)
+                and (not rest or len(rest) < 40)
+            ):
+                title = _textbook_heading_text(f"{title} {nxt}")
+                i = j  # advanced past continuation; +1 after emit
+            key = _textbook_norm_heading_key(title)
+            open_ch_num = ""
+            m_open_ch = re.match(r'глава\s+([ivxlcdm]+|\d+)', open_chapter_key, re.I)
+            if m_open_ch:
+                open_ch_num = m_open_ch.group(1).upper()
+            this_num = num.upper() if not num.isdigit() else num
+            if open_chapter_key and (key == open_chapter_key or open_ch_num == this_num):
+                i += 1
+                continue
+            open_chapter_key = key
+            open_section_key = ""
+            out.append(f"# {title}")
+            i += 1
+            continue
+
+        # Bare § opener: title on following line(s)
+        bare = _TEXTBOOK_SECTION_BARE_RE.match(s)
+        if bare:
+            num = bare.group(1).replace('–', '-').replace('—', '-').replace(' ', '')
+            title_parts: List[str] = []
+            j = i + 1
+            while j < n:
+                nj, nxt = _peek_nonempty(j)
+                if not nxt:
+                    break
+                if (
+                    _TEXTBOOK_CHAPTER_RE.match(nxt)
+                    or _TEXTBOOK_SECTION_BARE_RE.match(nxt)
+                    or _TEXTBOOK_SECTION_FULL_RE.match(nxt)
+                    or _textbook_is_allcaps_subhead(nxt)
+                    or _textbook_is_junk_line(nxt)
+                ):
+                    break
+                # Stop absorbing once we hit a long prose / epigraph
+                if (
+                    len(nxt) > 80
+                    or (nxt.endswith('.') and len(nxt) > 40)
+                    or nxt.startswith(('«', '"', '„', '('))
+                    or '—' in nxt
+                    or '–' in nxt
+                ):
+                    break
+                title_parts.append(nxt)
+                j = nj + 1
+                if len(title_parts) >= 3:
+                    break
+            title = _textbook_heading_text(f"§ {num}" + (f". {' '.join(title_parts)}" if title_parts else ""))
+            key = _textbook_norm_heading_key(title)
+            open_num = ""
+            m_open = re.match(r'§\s*(\d+(?:-\d+)?)', open_section_key)
+            if m_open:
+                open_num = m_open.group(1)
+            if open_section_key and (key == open_section_key or open_num == num):
+                # duplicate bare / same § number — skip
+                i = j if title_parts else i + 1
+                continue
+            open_section_key = key
+            out.append(f"## {title}")
+            i = j if title_parts else i + 1
+            continue
+
+        # Full «§ N. Title» (often running header; keep first, drop repeats)
+        full = _TEXTBOOK_SECTION_FULL_RE.match(s)
+        if full:
+            num = full.group(1).replace('–', '-').replace('—', '-').replace(' ', '')
+            rest = _textbook_heading_text(full.group(2))
+            title = f"§ {num}. {rest}"
+            key = _textbook_norm_heading_key(title)
+            # Match against open section (full or bare § N)
+            open_num = ""
+            m_open = re.match(r'§\s*(\d+(?:-\d+)?)', open_section_key)
+            if m_open:
+                open_num = m_open.group(1)
+            if open_section_key and (
+                key == open_section_key
+                or (open_num and open_num == num)
+            ):
+                i += 1
+                continue
+            open_section_key = key
+            out.append(f"## {title}")
+            i += 1
+            continue
+
+        # All-caps subheads
+        if _textbook_is_allcaps_subhead(s):
+            out.append(f"### {_textbook_heading_text(s)}")
+            i += 1
+            continue
+
+        out.append(_textbook_norm_ws(s) if s else "")
+        i += 1
+
+    text = "\n".join(out)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+class TextbookProcessor(DocumentProcessor):
+    """Обработчик школьных учебников (обществознание и т.п.).
+
+    Selected when document_kind=textbook. Injects #/##/### headings for
+    chapters, § sections and all-caps subheads; strips running headers and
+    cover/copyright junk; skips legal article/numbered-item postprocessing.
+    """
+
+    def can_process(self, path: str) -> bool:
+        # Only selected explicitly via DocumentProcessorManager(document_kind=textbook)
+        return False
+
+    def process(self, path: str) -> Dict[str, Any]:
+        md = self.convert_to_markdown(path, apply_pdf_footnotes=False)
+        md = _textbook_cleanup_text(md)
+        md = _textbook_rewrite_headings(md)
+        tree = parse_markdown_to_tree(md, legal_postprocess=False)
+        return tree
+
+
+# ---------- 8b) Обработчик энциклопедий (БРЭ и т.п.) ----------
+
+def _pdf_to_text_pypdf(path: str) -> str:
+    """Extract PDF text via pypdf (content-stream order).
+
+    markitdown's table heuristic interleaves two-column encyclopedia pages
+    and drops inter-word spaces; pypdf follows the content stream.
+    """
+    from pypdf import PdfReader
+
+    return "\n\n".join((page.extract_text() or "") for page in PdfReader(path).pages)
+
+
+# Glue a 1–2 letter ALL-CAPS token to the following word (ПУ СУНЛИН → ПУСУНЛИН).
+_ENCYCLOPEDIA_LETTERSPACE_LEAD_RE = re.compile(
+    r'(?:(?<=^)|(?<=\s))([А-ЯЁ]{1,2})\s+(?=[А-ЯЁ])',
+)
+# Glue a trailing 1–2 letter ALL-CAPS token to the previous word (РАСП ЕВ → РАСПЕВ).
+_ENCYCLOPEDIA_LETTERSPACE_TAIL_RE = re.compile(
+    r'(?<=[А-ЯЁ])\s+([А-ЯЁ]{1,2})(?=\s*$|[,(])',
+)
+
+
+def _encyclopedia_norm_headword(head: str) -> str:
+    """Collapse pypdf letter-spacing in ALL-CAPS titles.
+
+    ``ПУ СУНЛИН`` → ``ПУСУНЛИН``, ``ПУХОВЫЕ В ОЛОСЫ`` → ``ПУХОВЫЕ ВОЛОСЫ``.
+    Multi-word titles with 3+ letter tokens (``ПУТОРАНСКИЙ ЗАПОВЕДНИК``) stay split.
+    """
+    s = _textbook_norm_ws(head)
+    s = _ENCYCLOPEDIA_LETTERSPACE_LEAD_RE.sub(r'\1', s)
+    s = _ENCYCLOPEDIA_LETTERSPACE_TAIL_RE.sub(r'\1', s)
+    return s
+
+
+# Entry headword: ALL-CAPS run followed by "," or "(" (ПУТОРАКИ (Diplomesodon), …)
+_ENCYCLOPEDIA_HEADWORD_RE = re.compile(
+    r'^([А-ЯЁ][А-ЯЁ0-9\s\-–—«»\.]{2,70}?)\s*([,(])(.*)$',
+)
+# Biographical entry: ALL-CAPS surname + given name(s) + dates in () or [].
+# ПУТИН Владимир Владимирович (р. 7.10.1952, …)
+# ПУШКИН Александр Сергеевич [26.5(6.6).1799, …]
+_ENCYCLOPEDIA_BIO_HEADWORD_RE = re.compile(
+    r'^([А-ЯЁ]{4,40}(?:\s+[А-ЯЁ]{3,40})*)\s+'
+    r'([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){0,3}\s*[(\[].*)$',
+)
+# Editorial-board style initials: «А. А. АВДЕЕВ, …»
+_ENCYCLOPEDIA_INITIALS_RE = re.compile(
+    r'^(?:[А-ЯЁ]\.\s*){1,3}[А-ЯЁ]',
+)
+# Ambiguous short ALL-CAPS token (ИРМО, РКП) — only accept after sentence end.
+_ENCYCLOPEDIA_PREV_TERM_RE = re.compile(r'[.;!?]\s*$')
+# Trailing author signature like «Н. А. Щипанов.»
+_ENCYCLOPEDIA_AUTHOR_SIG_RE = re.compile(
+    r'^[А-ЯЁ]\.\s*(?:[А-ЯЁ]\.\s*)?[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)?\.\s*$',
+)
+
+
+def _encyclopedia_is_headword_line(line: str) -> Optional[re.Match]:
+    """Return match if *line* looks like an encyclopedia entry headword."""
+    s = (line or "").strip()
+    if not s:
+        return None
+    m = _ENCYCLOPEDIA_HEADWORD_RE.match(s)
+    if m is None:
+        m = _ENCYCLOPEDIA_BIO_HEADWORD_RE.match(s)
+    if not m:
+        return None
+    head = m.group(1).strip()
+    if _ENCYCLOPEDIA_INITIALS_RE.match(head):
+        return None
+    letters = [c for c in head if c.isalpha()]
+    # Real БРЭ headwords are at least ~4 letters (ПУТЬ); reject ЦК/АН noise.
+    if len(letters) < 4:
+        return None
+    if any(c.islower() for c in letters):
+        return None
+    # Reject headwords that are mostly digits/punctuation
+    if len(letters) < len(head) * 0.5:
+        return None
+    return m
+
+
+def _encyclopedia_headword_is_strong(match: re.Match) -> bool:
+    """True for unambiguous entry titles (long enough to skip prev-terminator)."""
+    head = match.group(1).strip()
+    letters = [c for c in head if c.isalpha()]
+    return len(letters) >= 5
+
+
+def _encyclopedia_cleanup_text(md: str) -> str:
+    """Reuse textbook cleanup, then drop author signature lines."""
+    md = _textbook_cleanup_text(md)
+    lines = md.splitlines()
+    cleaned: List[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and _ENCYCLOPEDIA_AUTHOR_SIG_RE.match(s):
+            continue
+        cleaned.append(s if s else "")
+    text = "\n".join(cleaned)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def _encyclopedia_rewrite_headings(md: str) -> str:
+    """Inject ``## HEADWORD`` for each alphabetical entry; drop front matter.
+
+    Strong headwords (5+ letters) are accepted on shape alone — multi-column
+    PDFs often put a non-terminator line before a real entry. Short 4-letter
+    tokens still require a sentence terminator on the previous line to avoid
+    promoting mid-text acronyms (ИРМО, РКП).
+    """
+    lines = md.splitlines()
+    out: List[str] = []
+    prev_nonempty = ""
+    first_entry_seen = False
+
+    for raw in lines:
+        s = raw.strip()
+        if not s:
+            if first_entry_seen:
+                out.append("")
+            continue
+
+        m = _encyclopedia_is_headword_line(s)
+        accept = False
+        if m is not None:
+            strong = _encyclopedia_headword_is_strong(m)
+            if not first_entry_seen:
+                # Any valid headword (not initials) may start the body.
+                accept = True
+            elif strong:
+                accept = True
+            elif not prev_nonempty or _ENCYCLOPEDIA_PREV_TERM_RE.search(prev_nonempty):
+                accept = True
+
+        if accept and m is not None:
+            head = _encyclopedia_norm_headword(m.group(1))
+            if m.lastindex and m.lastindex >= 3:
+                rest_prefix = m.group(2) + (m.group(3) or "")
+            else:
+                rest_prefix = m.group(2) or ""
+            rest_prefix = rest_prefix.strip()
+            out.append(f"## {head}")
+            if rest_prefix:
+                if rest_prefix.startswith('('):
+                    content_start = rest_prefix
+                elif rest_prefix.startswith(','):
+                    content_start = rest_prefix.lstrip(', ').strip()
+                else:
+                    content_start = rest_prefix
+                if content_start:
+                    out.append(content_start)
+            first_entry_seen = True
+            prev_nonempty = s
+            continue
+
+        if not first_entry_seen:
+            prev_nonempty = s
+            continue
+
+        out.append(_textbook_norm_ws(s))
+        prev_nonempty = s
+
+    text = "\n".join(out)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+class EncyclopediaProcessor(DocumentProcessor):
+    """Обработчик энциклопедий (БРЭ и т.п.).
+
+    Selected when document_kind=encyclopedia. Splits on ALL-CAPS alphabetical
+    entry headwords; strips stress-digit OCR artifacts and soft hyphens;
+    skips legal article/numbered-item postprocessing.
+    """
+
+    def can_process(self, path: str) -> bool:
+        return False
+
+    def process(self, path: str) -> Dict[str, Any]:
+        if path.lower().endswith('.pdf'):
+            md = self._normalize_unicode_superscripts(_pdf_to_text_pypdf(path).strip())
+        else:
+            md = self.convert_to_markdown(path, apply_pdf_footnotes=False)
+        md = _encyclopedia_cleanup_text(md)
+        md = _encyclopedia_rewrite_headings(md)
+        tree = parse_markdown_to_tree(md, legal_postprocess=False)
+        return tree
+
+
+# ---------- 9) Универсальный обработчик для прочих документов ----------
 
 class UniversalProcessor(DocumentProcessor):
     """Универсальный обработчик для всех остальных документов"""
@@ -2079,12 +2731,16 @@ class UniversalProcessor(DocumentProcessor):
         tree = parse_markdown_to_tree(md)
         return self.apply_cleaning_patterns(tree)
 
-# ---------- 9) Менеджер обработчиков ----------
+# ---------- 10) Менеджер обработчиков ----------
 
 class DocumentProcessorManager:
     """Менеджер для выбора и использования обработчиков"""
     
-    def __init__(self):
+    def __init__(self, document_kind: str = "normative"):
+        kind = (document_kind or "normative").strip().lower()
+        self.document_kind = (
+            kind if kind in ("normative", "textbook", "encyclopedia") else "normative"
+        )
         self.processors: List[DocumentProcessor] = [
             GarantProcessor(),
             ConsultantProcessor(),
@@ -2093,9 +2749,18 @@ class DocumentProcessorManager:
             DocxWithCustomStylesProcessor(),
             UniversalProcessor()  # Всегда последний как fallback
         ]
+        self._textbook = TextbookProcessor()
+        self._encyclopedia = EncyclopediaProcessor()
     
-    def process_document(self, path: str) -> Dict[str,Any]:
+    def process_document(self, path: str, document_kind: Optional[str] = None) -> Dict[str,Any]:
         """Обрабатывает документ используя подходящий обработчик"""
+        kind = (document_kind or self.document_kind or "normative").strip().lower()
+        if kind == "textbook":
+            print(f"[INFO] Используется обработчик: TextbookProcessor")
+            return self._textbook.process(path)
+        if kind == "encyclopedia":
+            print(f"[INFO] Используется обработчик: EncyclopediaProcessor")
+            return self._encyclopedia.process(path)
         for processor in self.processors:
             if processor.can_process(path):
                 print(f"[INFO] Используется обработчик: {processor.__class__.__name__}")
@@ -2103,7 +2768,7 @@ class DocumentProcessorManager:
         # Fallback на универсальный
         return UniversalProcessor().process(path)
 
-# ---------- 9) Утилиты сохранения/загрузки ----------
+# ---------- 11) Утилиты сохранения/загрузки ----------
 
 REQUIRED_KEYS = {"level","title","content","children"}
 
@@ -2126,30 +2791,56 @@ def save_tree_json(tree: Dict[str,Any], out_path: str, pretty=True):
         txt = json.dumps(tree, ensure_ascii=False, separators=(",",":"))
     Path(out_path).write_text(txt, encoding="utf-8")
 
-# ---------- 10) Публичный API ----------
+# ---------- 12) Публичный API ----------
 
-def extract_outline_from_document(path: str) -> Dict[str,Any]:
+__all__ = [
+    "extract_outline_from_document",
+    "save_tree_json",
+    "DocumentProcessor",
+    "DocumentProcessorManager",
+    "GarantProcessor",
+    "ConsultantProcessor",
+    "GOSTProcessor",
+    "DocxWithHeadingStylesProcessor",
+    "DocxWithCustomStylesProcessor",
+    "TextbookProcessor",
+    "EncyclopediaProcessor",
+    "UniversalProcessor",
+    "parse_markdown_to_tree",
+    "_textbook_cleanup_text",
+    "_textbook_rewrite_headings",
+    "_encyclopedia_cleanup_text",
+    "_encyclopedia_rewrite_headings",
+]
+
+def extract_outline_from_document(path: str, document_kind: str = "normative") -> Dict[str,Any]:
     """Универсальная функция для извлечения структуры из документа"""
-    manager = DocumentProcessorManager()
-    return manager.process_document(path)
+    manager = DocumentProcessorManager(document_kind=document_kind)
+    return manager.process_document(path, document_kind=document_kind)
 
-# ---------- 11) CLI-пример ----------
+# ---------- 13) CLI-пример ----------
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Convert documents to JSON outline (sections hierarchy).")
     ap.add_argument("inputs", nargs="+", help="Paths to documents (DOCX, PDF, etc.)")
     ap.add_argument("-o","--out", default="out", help="Output folder (default: ./out)")
+    ap.add_argument(
+        "--document-kind",
+        default="normative",
+        choices=["normative", "textbook", "encyclopedia"],
+        help="Pipeline flavour: normative (legal), textbook, or encyclopedia",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    manager = DocumentProcessorManager()
+    manager = DocumentProcessorManager(document_kind=args.document_kind)
     
     for p in args.inputs:
         try:
-            tree = manager.process_document(p)
+            tree = manager.process_document(p, document_kind=args.document_kind)
             save_tree_json(tree, out_dir / (Path(p).stem + ".json"), pretty=True)
             print(f"[ok] {p} → {out_dir / (Path(p).stem + '.json')}")
         except Exception as e:

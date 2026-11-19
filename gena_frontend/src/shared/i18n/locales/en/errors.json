@@ -1,0 +1,15 @@
+{
+  "generic": "Something went wrong. Please try again.",
+  "network": "Cannot reach the server. Check your connection and try again.",
+  "sessionExpired": "Your session expired. Please sign in again.",
+  "badCredentials": "Invalid username or password.",
+  "forbidden": "You don't have permission for this action.",
+  "unavailable": "Service temporarily unavailable.",
+  "modelUnavailable": "The selected model is unavailable. Choose another or try later.",
+  "chunkerFailed": "Document could not be split. Try another file format.",
+  "saveFailed": "Save failed: {{detail}}",
+  "loadFailed": "Could not load data. Check the connection and sign in.",
+  "retry": "Retry",
+  "routeCrashed": "This page failed to render.",
+  "reload": "Reload the page"
+}

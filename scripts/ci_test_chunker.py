@@ -4,9 +4,16 @@ CI Chunker Test — uploads a test docx to the local chunker service
 and validates that chunks are reasonable for question generation.
 
 Runs inside the chunker container (has requests via requirements).
-Usage:  python ci_test_chunker.py /tmp/test_doc.docx
+Usage:  python ci_test_chunker.py /tmp/test_doc.docx [--textbook-pdf /tmp/sample.pdf]
+
+The optional textbook PDF is chunked with document_kind=textbook and
+chunking_method=layout (no LLM involved) and checked for the textbook-specific
+guarantees: insets are separate chunks, running headers and exercises are
+dropped, pages are attached to body chunks.
 """
 
+import argparse
+import re
 import sys
 import os
 import statistics
@@ -20,7 +27,11 @@ CHUNKER_URL = "http://127.0.0.1:8517"
 MIN_EXPECTED_CHUNKS = 5
 MAX_EXPECTED_CHUNKS = 250
 MIN_MEDIAN_CHARS = 150
-MAX_ALLOWED_TINY = 35  # chunks < 500 chars
+# «Крошечный» = заметно ниже типичного чанка hierarchical_outline (медиана ~425):
+# такой фрагмент уже не несёт материала для вопроса. Доля, а не абсолютное число —
+# иначе порог зависит от размера тестового документа.
+TINY_CHARS = 200
+MAX_TINY_FRACTION = 0.15
 # Доля чанков с явным родительским контекстом (текст пути или path из заголовков)
 MIN_HIERARCHY_FRACTION = 0.12
 
@@ -45,14 +56,102 @@ def fail(msg):
     _print(f"  [FAIL] {msg}", file=sys.stderr)
 
 
-def main():
-    if len(sys.argv) < 2:
-        _print("Usage: ci_test_chunker.py <path_to_docx>", file=sys.stderr)
-        sys.exit(1)
+# ── Textbook / layout checks ────────────────────────────────────────
+# Колонтитул страницы учебника: «50 ГЛАВА I», «ГЛАВА I 51»,
+# «§ 4. Место и роль СССР … 51» (заголовок параграфа с номером страницы).
+RUNNING_HEADER_RE = re.compile(
+    r"^(?:\d{1,3}\s+ГЛАВА\s+[IVXLC]+|ГЛАВА\s+[IVXLC]+\s+\d{1,3}|§\s*\d+(?:-\d+)?\.\s.{3,120}\s\d{1,3})\s*$",
+    re.M,
+)
+# Задание, вклеенное в текст: маркер «⬤» или поручение «Узнайте/Выясните…».
+EXERCISE_RE = re.compile(r"⬤|(?:^|\n)\s*(?:Узнайте|Выясните|Подумайте|Объясните)\b", re.M)
+# Врезка из образца medinskiy_layout_sample.pdf (биография).
+SAMPLE_INSET_MARK = "Иосип Броз Тито"
 
-    doc_path = sys.argv[1]
+
+def _body(chunks):
+    return [c for c in chunks if (c.get("fragment_data") or {}).get("block_type") in (None, "body", "list")]
+
+
+def _text(c):
+    fd = c.get("fragment_data") or {}
+    return fd.get("content") or fd.get("combined_text") or ""
+
+
+def check_textbook_layout(requests, pdf_path):
+    _print("\n== T1. Textbook PDF, method=layout ==")
+    with open(pdf_path, "rb") as f:
+        resp = requests.post(
+            f"{CHUNKER_URL}/chunk/",
+            params={"document_kind": "textbook", "chunking_method": "layout"},
+            files={"file": ("test_textbook.pdf", f, "application/pdf")},
+            timeout=300,
+        )
+    if resp.status_code != 200:
+        fail(f"Chunker HTTP {resp.status_code}: {resp.text[:300]}")
+        return
+    data = resp.json()
+    chunks = data.get("chunks_detailed", [])
+    _print(f"  {len(chunks)} chunks, engine={data.get('chunking_engine')}, "
+           f"fallback={data.get('chunking_fallback')}, by_type={data.get('chunks_by_block_type')}")
+
+    if data.get("chunking_engine") == "layout_pdf" and not data.get("chunking_fallback"):
+        ok("layout engine ran without fallback")
+    else:
+        fail(f"expected layout_pdf without fallback, got engine={data.get('chunking_engine')} "
+             f"fallback={data.get('chunking_fallback')}")
+
+    _print("\n== T2. Insets are separate chunks ==")
+    insets = [c for c in chunks if (c.get("fragment_data") or {}).get("block_type") == "inset"]
+    body = _body(chunks)
+    inset_hit = any(SAMPLE_INSET_MARK in _text(c) for c in insets)
+    body_hit = any(SAMPLE_INSET_MARK in _text(c) for c in body)
+    if inset_hit and not body_hit:
+        ok(f"inset «{SAMPLE_INSET_MARK}» is its own chunk ({len(insets)} insets total)")
+    else:
+        fail(f"inset «{SAMPLE_INSET_MARK}»: in insets={inset_hit}, leaked into body={body_hit}")
+
+    _print("\n== T3. Running headers and exercises dropped ==")
+    headers = [c for c in chunks if RUNNING_HEADER_RE.search(_text(c))]
+    if not headers:
+        ok("no running headers inside chunks")
+    else:
+        fail(f"{len(headers)} chunks contain a running header, e.g. {_text(headers[0])[:80]!r}")
+    exercises = [c for c in chunks if EXERCISE_RE.search(_text(c))]
+    if not exercises:
+        ok("no exercise markers inside chunks")
+    else:
+        fail(f"{len(exercises)} chunks contain exercise text, e.g. {_text(exercises[0])[:80]!r}")
+    dropped = data.get("dropped_blocks") or {}
+    if (dropped.get("exercise") or {}).get("count", 0) > 0:
+        ok(f"exercises dropped: {dropped['exercise']}")
+    else:
+        fail(f"no exercises reported in dropped_blocks: {dropped}")
+
+    _print("\n== T4. Pages on body chunks ==")
+    pages = [((c.get("fragment_data") or {}).get("page_start"), (c.get("fragment_data") or {}).get("page_end")) for c in body]
+    if body and all(isinstance(a, int) and isinstance(b, int) and b >= a for a, b in pages):
+        ok(f"all {len(body)} body chunks carry page_start/page_end")
+    else:
+        fail(f"body chunks without valid pages: {[p for p in pages if not (isinstance(p[0], int) and isinstance(p[1], int))][:5]}")
+    if any(b > a for a, b in pages if isinstance(a, int) and isinstance(b, int)):
+        ok("at least one body chunk continues across a page break")
+    else:
+        fail("no body chunk spans a page break — paragraphs are cut at page ends")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("doc_path", help="normative DOCX (rules method, defaults)")
+    ap.add_argument("--textbook-pdf", help="textbook PDF for the layout-method checks")
+    args = ap.parse_args()
+
+    doc_path = args.doc_path
     if not os.path.isfile(doc_path):
         _print(f"File not found: {doc_path}", file=sys.stderr)
+        sys.exit(1)
+    if args.textbook_pdf and not os.path.isfile(args.textbook_pdf):
+        _print(f"File not found: {args.textbook_pdf}", file=sys.stderr)
         sys.exit(1)
 
     import requests
@@ -98,10 +197,12 @@ def main():
     mn, mx = min(lengths), max(lengths)
     mean = statistics.mean(lengths)
     med = statistics.median(lengths)
-    tiny = sum(1 for l in lengths if l < 500)
+    tiny = sum(1 for l in lengths if l < TINY_CHARS)
+    tiny_frac = tiny / len(lengths)
 
     _print(f"  min={mn}  max={mx}  mean={mean:.0f}  median={med:.0f}")
-    _print(f"  <500: {tiny}  500-1000: {sum(1 for l in lengths if 500<=l<1000)}"
+    _print(f"  <500: {sum(1 for l in lengths if l < 500)}"
+           f"  500-1000: {sum(1 for l in lengths if 500<=l<1000)}"
            f"  1000-2000: {sum(1 for l in lengths if 1000<=l<2000)}"
            f"  2000+: {sum(1 for l in lengths if l>=2000)}")
 
@@ -110,10 +211,12 @@ def main():
     else:
         fail(f"Median chunk size {med:.0f} < {MIN_MEDIAN_CHARS} — chunks are unusually small")
 
-    if tiny <= MAX_ALLOWED_TINY:
-        ok(f"Only {tiny} tiny chunks (<500 chars), max allowed {MAX_ALLOWED_TINY}")
+    if tiny_frac <= MAX_TINY_FRACTION:
+        ok(f"{tiny}/{len(lengths)} tiny chunks (<{TINY_CHARS} chars, {tiny_frac:.0%}), "
+           f"max allowed {MAX_TINY_FRACTION:.0%}")
     else:
-        fail(f"{tiny} tiny chunks (<500 chars) exceeds max {MAX_ALLOWED_TINY}")
+        fail(f"{tiny}/{len(lengths)} tiny chunks (<{TINY_CHARS} chars, {tiny_frac:.0%}) "
+             f"exceeds max {MAX_TINY_FRACTION:.0%}")
 
     # ── 4. Hierarchy context ────────────────────────────────────────
     _print("\n== 4. Hierarchy context ==")
@@ -190,6 +293,10 @@ def main():
         text = fd.get("combined_text", "")
         extra = " [SEM]" if fd.get("semantic_split") else ""
         _print(f"  Chunk {i} ({len(text)} chars){extra}: {text[:150].replace(chr(10), ' ')}...")
+
+    # ── 8. Textbook PDF via layout (optional) ────────────────────────
+    if args.textbook_pdf:
+        check_textbook_layout(requests, args.textbook_pdf)
 
     # ── Summary ─────────────────────────────────────────────────────
     _print(f"\n{'='*50}")

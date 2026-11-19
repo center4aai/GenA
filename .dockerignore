@@ -1,0 +1,23 @@
+# Root build context is used by agent_api/Dockerfile and chunker/Dockerfile.
+# They COPY only agent_api/, chunker/ and config/llm_defaults.env.
+.git
+.gitignore
+.gitlab-ci.yml
+.venv
+.pytest_cache
+**/__pycache__
+**/*.pyc
+.env
+.env.*
+*.secrets
+**/.secrets
+tests/
+docs/
+scripts/
+gena_frontend/
+dataset_api/
+task_worker/
+node_modules/
+playwright-report
+test-results
+**/*.md

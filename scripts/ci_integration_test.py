@@ -24,8 +24,19 @@ DATASET_API_URL = "http://dataset_api:8789"
 
 GATE_CHUNKS_LIMIT = 5
 TASKS_LIMIT = 2
-POLL_TIMEOUT_S = 300
+# One generation task may take ~5 min: a question the validator rejects goes
+# through up to two refine rounds (generation + 3 validations + 2 refines on
+# the shared LLM), plus up to 30 s until the worker polls the queue. The test
+# checks that the pipeline completes, not how fast the model is.
+POLL_TIMEOUT_S = 600
 POLL_INTERVAL_S = 10
+# Приоритет задач теста. Dev-воркер общий и забирает задачи
+# sort=[(priority, -1), (created_at, 1)]: с priority 1 тест вставал в хвост за
+# тысячами пользовательских задач генерации и не укладывался в POLL_TIMEOUT_S.
+# 8 — выше гейта (5) и генерации (1) пайплайна, но ниже чанкинга (9), чтобы не
+# задерживать начало чужих прогонов. Тест кладёт 2–4 задачи, так что
+# пользовательскую очередь он задерживает максимум на несколько минут.
+CI_TASK_PRIORITY = 8
 
 _passed = 0
 _failed = 0
@@ -172,7 +183,7 @@ def main():
         step("3. Create queue")
         resp = requests.post(
             f"{DATASET_API_URL}/queues/",
-            json={"name": queue_name, "description": "CI integration test", "priority": 1},
+            json={"name": queue_name, "description": "CI integration test", "priority": CI_TASK_PRIORITY},
             timeout=30,
         )
         if resp.status_code == 200:
@@ -258,7 +269,7 @@ def main():
                 "dataset_name": dataset_name,
                 "dataset_id": dataset_id,
                 "dataset_description": "CI integration test dataset",
-                "priority": 1,
+                "priority": CI_TASK_PRIORITY,
                 "chunk_pre_validated": True,
             })
 
@@ -325,6 +336,117 @@ def main():
                 fail("Dataset has 0 questions after processing")
         else:
             fail(f"Dataset fetch failed: HTTP {resp.status_code}")
+
+        # ── 9. Async gate flow (task_type=gate in the queue) ─────────
+        step("9. Async gate task: worker validates chunk and fans out generation")
+        gate_chunk_idx = passed_chunks[0]
+        ch = sample[gate_chunk_idx]
+        gate_text = (
+            ch.get("fragment_data", {}).get("combined_text", "")
+            or ch.get("_text", "")
+            or str(ch)
+        )
+        # Re-save the chunk as "gate pending" so the worker's verdict is observable.
+        resp = requests.post(
+            f"{DATASET_API_URL}/datasets/{dataset_id}/chunks",
+            json=[{
+                "chunk_index": gate_chunk_idx,
+                "chunk_text": gate_text,
+                "gate_result": None,
+                "gate_passed": False,
+                "gate_pending": True,
+                "question_types_valid": [],
+            }],
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            fail(f"Chunk reset for async gate failed: HTTP {resp.status_code}")
+
+        resp = requests.post(
+            f"{DATASET_API_URL}/queues/{queue_name}/tasks/",
+            json=[{
+                "chunk_id": gate_chunk_idx,
+                "chunk_text": gate_text,
+                "question_type": "one",
+                "question_types": ["one"],
+                "task_type": "gate",
+                "source_document": "Family_code_Russian_Federation_1-4.docx",
+                "dataset_name": dataset_name,
+                "dataset_id": dataset_id,
+                "priority": CI_TASK_PRIORITY,
+            }],
+            timeout=30,
+        )
+        if resp.status_code == 200 and resp.json().get("tasks_added") == 1:
+            ok("Gate task enqueued")
+        else:
+            fail(f"Gate task enqueue failed: HTTP {resp.status_code} {resp.text[:200]}")
+            return
+
+        deadline = time.time() + POLL_TIMEOUT_S
+        gate_done = False
+        while time.time() < deadline:
+            try:
+                resp = requests.get(
+                    f"{DATASET_API_URL}/datasets/{dataset_id}/chunks",
+                    params={"gate_passed_only": "false"},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    chunks_now = {c["chunk_index"]: c for c in resp.json()}
+                    target = chunks_now.get(gate_chunk_idx, {})
+                    if target.get("gate_pending") is False and target.get("gate_result"):
+                        gate_done = True
+                        _print(f"  Gate verdict stored: passed={target.get('gate_passed')}")
+                        break
+            except Exception as e:
+                _print(f"  Poll error: {e}")
+            time.sleep(POLL_INTERVAL_S)
+
+        if gate_done:
+            ok("Async gate verdict stored on the chunk (gate_pending=False)")
+        else:
+            fail(f"Async gate verdict not stored within {POLL_TIMEOUT_S}s")
+
+        # If the chunk passed, the worker must have enqueued generation tasks.
+        try:
+            gate_task = None
+            spawned = []
+            terminal_deadline = time.time() + 120
+            while time.time() < terminal_deadline:
+                resp = requests.get(
+                    f"{DATASET_API_URL}/queues/{queue_name}/tasks/",
+                    params={"limit": 200},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    all_tasks = resp.json()
+                    gate_tasks = [t for t in all_tasks if t.get("task_type") == "gate"]
+                    gate_task = gate_tasks[0] if gate_tasks else None
+                    spawned = [
+                        t for t in all_tasks
+                        if t.get("task_type") != "gate"
+                        and t.get("chunk_id") == gate_chunk_idx
+                        and t.get("chunk_pre_validated")
+                    ]
+                    if gate_task and gate_task.get("status") in ("completed", "failed"):
+                        break
+                time.sleep(POLL_INTERVAL_S)
+
+            if gate_task and gate_task.get("status") == "completed":
+                ok(f"Gate task reached terminal status: {gate_task['status']}")
+            else:
+                fail(
+                    "Gate task did not reach completed "
+                    f"(status: {gate_task.get('status') if gate_task else 'missing'}, "
+                    f"error: {(gate_task or {}).get('error')})"
+                )
+            if gate_task and gate_task.get("status") == "completed" and not spawned:
+                fail("Gate passed but no generation tasks were fanned out")
+            elif spawned:
+                ok(f"{len(spawned)} generation task(s) fanned out by the gate")
+        except Exception as e:
+            fail(f"Async gate verification error: {e}")
 
     finally:
         # ── 9. Cleanup ───────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 interface PagedListOptions<T> {
   pageSize?: number;
@@ -8,7 +8,7 @@ interface PagedListOptions<T> {
 
 /**
  * Client-side filter + pagination for potentially large lists.
- * Resets to page 1 whenever the filtered length changes (e.g. new search).
+ * Resets to page 1 whenever the filtered length or search changes.
  */
 export function usePagedList<T>(items: T[], options: PagedListOptions<T> = {}) {
   const { pageSize = 10, search = '', searchFields } = options;
@@ -21,6 +21,15 @@ export function usePagedList<T>(items: T[], options: PagedListOptions<T> = {}) {
       searchFields(item).some((f) => String(f ?? '').toLowerCase().includes(q)),
     );
   }, [items, search, searchFields]);
+
+  const filterKey = `${search}|${filtered.length}`;
+  const prevFilterKey = useRef(filterKey);
+  useEffect(() => {
+    if (prevFilterKey.current !== filterKey) {
+      setPage(1);
+      prevFilterKey.current = filterKey;
+    }
+  }, [filterKey]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, totalPages);

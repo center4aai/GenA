@@ -3,31 +3,59 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langchain_core.runnables import Runnable
 from dataclasses import dataclass
+import logging
 import random
 
 from typing import Optional
+from llm_factory import TRANSIENT_LLM_ERRORS
 from agent.pipeline_modes import (
     normalize_pipeline_mode,
     pipeline_gate_enabled,
     pipeline_refine_enabled,
 )
+from agent.nodes.normalize_output import normalize_question_output
+from agent.nodes.chunk_gate.chunk_gate import synthetic_gate_pass
+
+logger = logging.getLogger(__name__)
+
 
 class AgentState(TypedDict):
     chunk: str
     question_type: str
     source: str
+    source_text: str
     language: Optional[str]  # ru, be, tg
     pipeline_mode: str
+    document_kind: str
+    # body | list | inset | caption | glossary_entry (None for legacy chunks).
+    # Declared here because LangGraph drops undeclared state keys.
+    block_type: Optional[str]
     chunk_pre_validated: bool
+    refine_available: bool
     chunk_gate_result: dict
     chunk_rejected: bool
     generated_question: dict
     sensitivity_score: dict
     difficulty_score: dict
     validation_result: dict
-    final_json: dict
+    # True, если хотя бы одна из оценок (provocativeness/difficulty) не
+    # состоялась; тогда её score/explanation равны None, а причина — в
+    # assessment_errors. Воркер по этому маркеру не сохраняет «оценку».
+    assessment_failed: bool
+    assessment_errors: List[str]
+    # Refine вернул исходный вопрос с маркером refine_failed: граф завершается,
+    # не гоняя тот же вопрос по оценкам/валидации ещё раз.
+    refine_failed: bool
     questions: Optional[List[str]]
     retry_count: int
+    # Refine can make a question worse, so the best attempt is carried along and
+    # restored at the end. These MUST stay declared: LangGraph drops any key a
+    # node returns that is not part of the state schema, which silently killed
+    # this logic before.
+    original_question: dict
+    best_question: dict
+    best_validation_total: Optional[float]
+    best_validation_result: dict
 
 
 def shuffle_answer_options(question_data: dict, question_type: str) -> dict:
@@ -54,76 +82,88 @@ def shuffle_answer_options(question_data: dict, question_type: str) -> dict:
         else:
             return question_data
     
-    # Собираем все непустые варианты ответа
-    options = []
+    # Собираем все непустые варианты ответа с исходными позициями (1-based)
+    option_pairs = []
     for i in range(1, 10):
         key = f"option_{i}"
         value = question_data.get(key)
         if value and value not in [None, "None"]:
-            options.append(value)
-    
-    if not options:
+            option_pairs.append((i, value))
+
+    if not option_pairs:
         return question_data
-    
+
     # Определяем правильные ответы из поля outputs
     outputs = question_data.get("outputs", "")
     if isinstance(outputs, int):
         outputs = str(outputs)
     elif not isinstance(outputs, str):
         outputs = str(outputs)
-    
+
     # Парсим правильные ответы
     if question_type == "one":
-        # Для типа "one" outputs - это один номер (строка или число)
         try:
             correct_indices = [int(outputs.strip())]
         except (ValueError, AttributeError):
             return question_data
     elif question_type == "multi":
-        # Для типа "multi" outputs - это номера через запятую без пробелов
         try:
             correct_indices = [int(x.strip()) for x in outputs.split(",") if x.strip()]
         except (ValueError, AttributeError):
             return question_data
     else:
         return question_data
-    
-    # Получаем правильные значения ответов (индексы в options начинаются с 0, а номера option_* с 1)
-    correct_values = []
-    for idx in correct_indices:
-        if 1 <= idx <= len(options):
-            correct_values.append(options[idx - 1])
-    
-    if not correct_values:
+
+    valid_positions = {pos for pos, _ in option_pairs}
+    correct_set = {idx for idx in correct_indices if idx in valid_positions}
+    if not correct_set:
         return question_data
-    
-    # Перемешиваем варианты ответа
-    shuffled_options = options.copy()
-    random.shuffle(shuffled_options)
-    
+
+    # Перемешиваем пары (позиция, значение) и пересчитываем индексы по перестановке
+    shuffled_pairs = option_pairs.copy()
+    random.shuffle(shuffled_pairs)
+
+    old_to_new = {old_pos: new_pos for new_pos, (old_pos, _) in enumerate(shuffled_pairs, start=1)}
+
     for i in range(1, 10):
         question_data[f"option_{i}"] = None
-    
-    for i, value in enumerate(shuffled_options, start=1):
-        question_data[f"option_{i}"] = value
-    
-    new_correct_indices = []
-    for i, value in enumerate(shuffled_options, start=1):
-        if value in correct_values:
-            new_correct_indices.append(i)
-    
+
+    for new_pos, (_, value) in enumerate(shuffled_pairs, start=1):
+        question_data[f"option_{new_pos}"] = value
+
+    new_correct_indices = sorted(old_to_new[idx] for idx in correct_set if idx in old_to_new)
+
     if question_type == "one":
         if new_correct_indices:
             question_data["outputs"] = new_correct_indices[0]
     elif question_type == "multi":
         if new_correct_indices:
-            new_correct_indices.sort()
             question_data["outputs"] = ",".join(map(str, new_correct_indices))
     
     return question_data
 
 
 MAX_REFINE_RETRIES = 2
+
+
+def _read_assessment(result, score_field: str):
+    """(score, explanation, failed, error) из результата цепочки оценки.
+
+    Принимает и Pydantic-модель, и словарь. Отсутствующий score трактуется как
+    сбой оценки, а не как значение по умолчанию.
+    """
+    if isinstance(result, dict):
+        get = result.get
+    else:
+        def get(key, default=None):
+            return getattr(result, key, default)
+    failed = bool(get("assessment_failed", False))
+    score = get(score_field)
+    explanation = get("explanation")
+    error = get("assessment_error")
+    if failed or score is None:
+        return None, None, True, str(error or f"{score_field} missing")
+    return score, explanation, False, None
 
 
 @dataclass
@@ -158,7 +198,10 @@ class GENAAssistant:
             "end": END,
             "refine": "refine_question",
         })
-        builder.add_edge("refine_question", "validation")
+        builder.add_conditional_edges("refine_question", self._after_refine, {
+            "end": END,
+            "assess": "provocativeness",
+        })
 
         if self.checkpointer is not None:
             self.graph = builder.compile(checkpointer=self.checkpointer)
@@ -175,12 +218,23 @@ class GENAAssistant:
     def _should_retry(state: AgentState) -> Literal["end", "refine"]:
         if not pipeline_refine_enabled(state.get("pipeline_mode")):
             return "end"
-        vr = state.get("validation_result", {})
-        if vr.get("passed", True):
+        if not state.get("refine_available", False):
             return "end"
-        if state.get("retry_count", 0) >= MAX_REFINE_RETRIES:
+        if state.get("refine_failed", False):
+            return "end"
+        vr = state.get("validation_result") or {}
+        if vr.get("passed") is not False:
+            return "end"
+        retry_count = state.get("retry_count") or 0
+        if retry_count >= MAX_REFINE_RETRIES:
             return "end"
         return "refine"
+
+    @staticmethod
+    def _after_refine(state: AgentState) -> Literal["end", "assess"]:
+        if state.get("refine_failed", False):
+            return "end"
+        return "assess"
 
     def chunk_gate_node(self, state: AgentState) -> AgentState:
         """Предварительная валидация чанка — gate-фильтр.
@@ -194,21 +248,30 @@ class GENAAssistant:
                 **state,
                 "pipeline_mode": pipeline_mode,
                 "chunk_rejected": False,
-                "chunk_gate_result": {
-                    "passed": True,
-                    "rejection_reason": "gate_disabled_by_pipeline_mode",
-                },
+                "chunk_gate_result": synthetic_gate_pass("gate_disabled_by_pipeline_mode"),
             }
 
         if state.get("chunk_pre_validated"):
-            return {**state, "pipeline_mode": pipeline_mode, "chunk_rejected": False, "chunk_gate_result": {}}
+            return {
+                **state,
+                "pipeline_mode": pipeline_mode,
+                "chunk_rejected": False,
+                "chunk_gate_result": synthetic_gate_pass("chunk_pre_validated"),
+            }
 
         if self.chunk_gate_chain is None:
-            return {**state, "pipeline_mode": pipeline_mode, "chunk_rejected": False, "chunk_gate_result": {}}
+            return {
+                **state,
+                "pipeline_mode": pipeline_mode,
+                "chunk_rejected": False,
+                "chunk_gate_result": synthetic_gate_pass("gate_chain_not_configured"),
+            }
 
         result = self.chunk_gate_chain.invoke({
             "chunk": state["chunk"],
             "question_type": state["question_type"],
+            "document_kind": state.get("document_kind") or "normative",
+            "block_type": state.get("block_type"),
         })
 
         gate_dict = result.model_dump() if hasattr(result, "model_dump") else dict(result)
@@ -225,20 +288,29 @@ class GENAAssistant:
         input_data = {
             "input_text": state["chunk"],
             "question_type": state["question_type"],
-            "source": state.get("source", "")
+            "source": state.get("source", ""),
+            "document_kind": state.get("document_kind") or "normative",
+            "block_type": state.get("block_type"),
         }
         # Добавляем язык, если он указан в состоянии
         if "language" in state and state.get("language"):
             input_data["language"] = state["language"]
         
         result = self.generate_question_chain.invoke(input_data)
-        
-        # Перемешиваем варианты ответа после генерации
+
+        result = normalize_question_output(result, state["question_type"])
         result = shuffle_answer_options(result, state["question_type"])
-        
+        if state.get("source_text"):
+            if not isinstance(result, dict):
+                result = dict(result) if hasattr(result, "items") else {"task": str(result)}
+            result["source_text"] = state["source_text"]
+
         return {
-            **state, 
-            "generated_question": result
+            **state,
+            "generated_question": result,
+            "original_question": result,
+            "best_question": result,
+            "best_validation_total": None,
         }
 
 
@@ -253,20 +325,27 @@ class GENAAssistant:
                 generated_question = generated_question.dict()
         
         result = self.provocativeness_chain.invoke({
-            "generated_question": generated_question
-            })
-        
-        # Убеждаемся, что result - это объект ProvocativenessOutput
-        if isinstance(result, dict):
-            provocativeness_score = result.get('provocativeness_score', 0)
-            explanation = result.get('explanation', '')
-        else:
-            provocativeness_score = result.provocativeness_score
-            explanation = result.explanation
-            
+            "generated_question": generated_question,
+            "source_text": state.get("source_text", ""),
+        })
+
+        provocativeness_score, explanation, failed, error = _read_assessment(
+            result, "provocativeness_score"
+        )
+        if failed:
+            logger.warning("Sensitivity assessment failed: %s", error)
+
+        # Первая оценка в круге: сбрасываем маркеры предыдущего круга refine.
         return {
-            **state, 
-            "sensitivity_score": {'provocativeness_score': provocativeness_score, 'explanation': explanation}
+            **state,
+            "sensitivity_score": {
+                "provocativeness_score": provocativeness_score,
+                "explanation": explanation,
+                "assessment_failed": failed,
+                "assessment_error": error,
+            },
+            "assessment_failed": failed,
+            "assessment_errors": [f"provocativeness: {error}"] if failed else [],
         }
     def difficulty_node(self, state: AgentState) -> AgentState:
         """Оценка сложности вопроса"""
@@ -279,23 +358,27 @@ class GENAAssistant:
                 generated_question = generated_question.dict()
         
         result = self.difficulty_chain.invoke({
-            "generated_question": generated_question
+            "generated_question": generated_question,
+            "source_text": state.get("source_text", ""),
         })
-        
-        # Убеждаемся, что result - это объект DifficultyOutput
-        if isinstance(result, dict):
-            difficulty = result.get('difficulty', 0)
-            explanation = result.get('explanation', '')
-        else:
-            difficulty = result.difficulty
-            explanation = result.explanation
-            
+
+        difficulty, explanation, failed, error = _read_assessment(result, "difficulty")
+        if failed:
+            logger.warning("Difficulty assessment failed: %s", error)
+
+        errors = list(state.get("assessment_errors") or [])
+        if failed:
+            errors.append(f"difficulty: {error}")
         return {
             **state,
             "difficulty_score": {
                 "difficulty": difficulty,
-                "explanation": explanation
-            }
+                "explanation": explanation,
+                "assessment_failed": failed,
+                "assessment_error": error,
+            },
+            "assessment_failed": bool(state.get("assessment_failed")) or failed,
+            "assessment_errors": errors,
         }
 
     def validation_node(self, state: AgentState) -> AgentState:
@@ -310,22 +393,57 @@ class GENAAssistant:
             else:
                 raise ValueError(f"Unexpected type for generated_question: {type(generated_question)}")
         
+        source_text = state.get("source_text") or generated_question.get("source_text", "")
         result = self.validation_chain.invoke({
             "question_type": state["question_type"],
-            "source_text": generated_question.get("source_text", ""),
-            "question": {k: v for k, v in generated_question.items() if k != "source_text" and v is not None}
+            "source_text": source_text,
+            "question": {k: v for k, v in generated_question.items() if k != "source_text" and v is not None},
+            "document_kind": state.get("document_kind") or "normative",
         })
-        return {
-            **state, 
-            "validation_result": {
+        if isinstance(result, dict):
+            validation_result = {
+                "type": result.get("type", state["question_type"]),
+                "by_block": result.get("by_block", {}),
+                "block_weighted": result.get("block_weighted", {}),
+                "block_max": result.get("block_max", {}),
+                "justifications": result.get("justifications", {}),
+                "total": result.get("total", 0.0),
+                "max_total": result.get("max_total", 0.0),
+                "threshold": result.get("threshold", 0.0),
+                "passed": result.get("passed", False),
+                "parse_complete": result.get("parse_complete", False),
+            }
+        else:
+            validation_result = {
                 "type": result.type,
                 "by_block": result.by_block,
+                "block_weighted": result.block_weighted,
+                "block_max": result.block_max,
                 "justifications": result.justifications,
                 "total": result.total,
                 "max_total": result.max_total,
                 "threshold": result.threshold,
-                "passed": result.passed
+                "passed": result.passed,
+                "parse_complete": result.parse_complete,
             }
+        total = float(validation_result.get("total") or 0)
+        best_total = state.get("best_validation_total")
+        best_question = state.get("best_question") or generated_question
+        best_vr = state.get("best_validation_result") or validation_result
+        if best_total is None or total >= float(best_total):
+            best_question = generated_question
+            best_total = total
+            best_vr = validation_result
+        else:
+            generated_question = best_question
+            validation_result = best_vr
+        return {
+            **state,
+            "generated_question": generated_question,
+            "validation_result": validation_result,
+            "best_question": best_question,
+            "best_validation_total": best_total,
+            "best_validation_result": best_vr,
         }
 
     def refine_question_node(self, state: AgentState) -> AgentState:
@@ -340,67 +458,58 @@ class GENAAssistant:
             elif hasattr(generated_question, 'dict'):
                 generated_question = generated_question.dict()
 
-        result = self.refine_question_chain.invoke({
+        source_text = state.get("source_text") or generated_question.get("source_text", "")
+        refine_input = {
             "question_type": state["question_type"],
-            "source_text": generated_question.get("source_text", ""),
+            "source_text": source_text,
             "question": {k: v for k, v in generated_question.items() if k != "source_text" and v is not None},
             "validation_result": state.get("validation_result", {}),
-        })
+            "document_kind": state.get("document_kind") or "normative",
+            "block_type": state.get("block_type"),
+        }
+        if state.get("language"):
+            refine_input["language"] = state["language"]
 
+        try:
+            result = self.refine_question_chain.invoke(refine_input)
+        except TRANSIENT_LLM_ERRORS:
+            raise
+        except Exception as exc:
+            logger.warning("Refine failed, keeping previous question: %s", exc)
+            return {
+                **state,
+                "refine_failed": True,
+                "retry_count": (state.get("retry_count") or 0) + 1,
+            }
+
+        refine_failed = (
+            result.get("refine_failed") if isinstance(result, dict)
+            else getattr(result, "refine_failed", False)
+        )
+        if refine_failed:
+            refine_error = (
+                result.get("refine_error") if isinstance(result, dict)
+                else getattr(result, "refine_error", None)
+            )
+            logger.warning(
+                "Refine returned the original question (%s); stopping without re-assessment",
+                refine_error,
+            )
+            return {
+                **state,
+                "refine_failed": True,
+                "retry_count": (state.get("retry_count") or 0) + 1,
+            }
+
+        result = normalize_question_output(result, state["question_type"])
         result = shuffle_answer_options(result, state["question_type"])
+        if source_text:
+            if not isinstance(result, dict):
+                result = dict(result) if hasattr(result, "items") else {"task": str(result)}
+            result["source_text"] = source_text
 
         return {
             **state,
             "generated_question": result,
             "retry_count": state.get("retry_count", 0) + 1,
         }
-
-    # def search_milvus_node(self, state: AgentState) -> AgentState:
-    #     """Поиск в Milvus"""
-    #     result = self.retriever_chain.invoke({
-    #         "query": state["generated_question"]
-    #     })
-    #     return {
-    #         **state, 
-    #         "milvus_results": result.search_result
-    #     }
-        
-    # def format_output_node(self, state: AgentState) -> AgentState:
-    #     """Форматирование вывода"""
-    #     result = self.format_output_chain.invoke({
-    #         "generated_question": state["generated_question"],
-    #         "milvus_results": state["milvus_results"],
-    #         "sensitivity_score": state["sensitivity_score"]
-    #     })
-    #     return {
-    #         **state, 
-    #         "final_json": result.final_json
-    #     }
-
-    # ────────────────────────────────────────────────────────────────────
-    # PLACEHOLDER: chunk_transformer_node — будущая замена chunk_gate.
-    #
-    # Трансформер будет спрашивать у LLM:
-    #   - сколько вопросов имеет смысл генерировать по этому чанку
-    #   - по каким модальностям (one / multi / open)
-    # Промпт и детали реализации — будут добавлены позже.
-    #
-    # Пример будущего state:
-    #   chunk_plan: Optional[dict]  # {"suggested_counts": {"one": 2, "multi": 1}, "modalities": ["one","multi"]}
-    #
-    # def chunk_transformer_node(self, state: AgentState) -> AgentState:
-    #     """Анализ чанка: сколько вопросов и по каким модальностям генерировать.
-    #
-    #     Заменит chunk_gate_node — вместо бинарного pass/fail
-    #     возвращает рекомендацию по количеству и типам вопросов.
-    #     """
-    #     if self.chunk_transformer_chain is None:
-    #         return {**state, "chunk_plan": None}
-    #
-    #     result = self.chunk_transformer_chain.invoke({
-    #         "chunk": state["chunk"],
-    #         "question_type": state["question_type"],
-    #     })
-    #     plan = result.model_dump() if hasattr(result, "model_dump") else dict(result)
-    #     return {**state, "chunk_plan": plan}
-    # ────────────────────────────────────────────────────────────────────

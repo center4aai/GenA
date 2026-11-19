@@ -8,10 +8,12 @@ const VALIDATION_MAX_POINTS: Record<string, number> = {
   multi: 20.5,
 };
 
-// Exact order of the extended "All Pipeline" template (mirrors
-// dataset_editor._EXTENDED_EXPORT_COLUMNS).
+// Exact order of the extended "All Pipeline" template.
 export const EXTENDED_EXPORT_COLUMNS = [
   'chunk_id',
+  'block_type',
+  'page_start',
+  'page_end',
   'gate_passed',
   'gate_rejection_reason',
   'c1_chunk_informative',
@@ -38,6 +40,7 @@ export const EXTENDED_EXPORT_COLUMNS = [
   'validation_max',
   'validation_details',
   'validation_justifications',
+  'validation_model_id',
   'retry_count',
   'source_chunk',
 ] as const;
@@ -56,6 +59,9 @@ function gateScore(value: unknown): number | null {
 function gateColumnsForChunk(chunk?: ChunkRecord) {
   if (!chunk) {
     return {
+      block_type: null,
+      page_start: null,
+      page_end: null,
       gate_passed: null,
       gate_rejection_reason: null,
       c1_chunk_informative: null,
@@ -84,7 +90,11 @@ function gateColumnsForChunk(chunk?: ChunkRecord) {
     c2_chunk_reference_clarity: gateResult.c2_reasoning ?? null,
     c3_chunk_multi_suitability: gateResult.c3_reasoning ?? null,
   };
+  const fd = (chunk.fragment_data ?? {}) as Record<string, unknown>;
   return {
+    block_type: typeof fd.block_type === 'string' ? fd.block_type : null,
+    page_start: typeof fd.page_start === 'number' ? fd.page_start : null,
+    page_end: typeof fd.page_end === 'number' ? fd.page_end : null,
     gate_passed: gateScore(gatePassed),
     gate_rejection_reason: gateResult.rejection_reason ?? null,
     c1_chunk_informative: gateScore(gateResult.c1_chunk_informative),
@@ -115,7 +125,16 @@ function chunkSortKey(v: unknown): [number, number | string] {
   return [1, v != null ? String(v) : ''];
 }
 
-export function buildExtendedExportRows(questions: Question[], chunks: ChunkRecord[]) {
+/** Validator of a question; old questions do not store it → the set's validator. */
+function validationModelOf(q: Question, fallback?: string | null): string | null {
+  return q.validation_model_id || fallback || null;
+}
+
+export function buildExtendedExportRows(
+  questions: Question[],
+  chunks: ChunkRecord[],
+  fallbackValidationModel?: string | null,
+) {
   const chunksById: Record<string | number, ChunkRecord> = {};
   for (const c of chunks) {
     if (c.chunk_index != null) {
@@ -145,14 +164,15 @@ export function buildExtendedExportRows(questions: Question[], chunks: ChunkReco
       task: q.task,
       options: normOptions(q.options),
       correct_answer: q.correct_answer,
-      sensitivity_level: q.sensitivity_level ?? q.provocativeness,
-      difficulty_level: q.difficulty_level ?? q.difficulty,
+      sensitivity_level: q.provocativeness ?? q.sensitivity_level,
+      difficulty_level: q.difficulty ?? q.difficulty_level,
       validation_passed: q.validation_passed,
-      validation_score: score ?? q.validation_score,
+      validation_score: score != null ? score : q.validation_score,
       validation_threshold: q.validation_threshold,
       validation_max: maxTotal,
       validation_details: q.validation_details,
       validation_justifications: q.validation_justifications,
+      validation_model_id: validationModelOf(q, fallbackValidationModel),
       retry_count: q.retry_count,
       source_chunk: q.source_chunk ?? gateCols.source_chunk,
     });
@@ -161,6 +181,10 @@ export function buildExtendedExportRows(questions: Question[], chunks: ChunkReco
   for (const [cid, chunk] of Object.entries(chunksById)) {
     if (seenChunkIds.has(cid) || seenChunkIds.has(Number(cid))) continue;
     seenChunkIds.add(cid);
+    if (chunk.chunk_index != null) {
+      seenChunkIds.add(chunk.chunk_index);
+      seenChunkIds.add(String(chunk.chunk_index));
+    }
     const gateCols = gateColumnsForChunk(chunk);
     rows.push({
       chunk_id: chunk.chunk_index,
@@ -178,7 +202,9 @@ export function buildExtendedExportRows(questions: Question[], chunks: ChunkReco
       validation_max: null,
       validation_details: null,
       validation_justifications: null,
+      validation_model_id: null,
       retry_count: null,
+      source_chunk: chunk.chunk_text ?? gateCols.source_chunk,
     });
   }
 
@@ -199,7 +225,7 @@ export function buildExtendedExportRows(questions: Question[], chunks: ChunkReco
   });
 }
 
-export function buildResultsExportRows(questions: Question[]) {
+export function buildResultsExportRows(questions: Question[], fallbackValidationModel?: string | null) {
   const coreOrder = [
     'chunk_id',
     'question_id',
@@ -215,6 +241,7 @@ export function buildResultsExportRows(questions: Question[]) {
     'validation_max',
     'validation_details',
     'validation_justifications',
+    'validation_model_id',
     'retry_count',
     'source_chunk',
   ];
@@ -227,14 +254,15 @@ export function buildResultsExportRows(questions: Question[]) {
       task: q.task,
       options: normOptions(q.options),
       correct_answer: q.correct_answer,
-      sensitivity_level: q.sensitivity_level ?? q.provocativeness,
-      difficulty_level: q.difficulty_level ?? q.difficulty,
+      sensitivity_level: q.provocativeness ?? q.sensitivity_level,
+      difficulty_level: q.difficulty ?? q.difficulty_level,
       validation_passed: q.validation_passed,
-      validation_score: score ?? q.validation_score,
+      validation_score: score != null ? score : q.validation_score,
       validation_threshold: q.validation_threshold,
       validation_max: maxTotal,
       validation_details: q.validation_details,
       validation_justifications: q.validation_justifications,
+      validation_model_id: validationModelOf(q, fallbackValidationModel),
       retry_count: q.retry_count,
       source_chunk: q.source_chunk,
     };
@@ -244,13 +272,38 @@ export function buildResultsExportRows(questions: Question[]) {
   });
 }
 
+/** Columns present in ANY row, in first-seen order. */
+export function csvHeaders(rows: Record<string, unknown>[]): string[] {
+  const headers: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        headers.push(key);
+      }
+    }
+  }
+  return headers;
+}
+
+/** Render one value: objects as JSON, formulas neutralized. */
+export function csvCell(value: unknown): string {
+  if (value == null) return '';
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  // Same guard as xlsx.ts: a stem starting with «=» or «-» is a live formula.
+  return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+}
+
 export function downloadCsv(filename: string, rows: Record<string, unknown>[]) {
   if (!rows.length) return;
-  const headers = Object.keys(rows[0]);
+  // Union of all keys: taking them from the first row alone silently dropped
+  // every column that row happened not to have.
+  const headers = csvHeaders(rows);
   const lines = [
     headers.join(','),
     ...rows.map((r) =>
-      headers.map((h) => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(','),
+      headers.map((h) => `"${csvCell(r[h]).replace(/"/g, '""')}"`).join(','),
     ),
   ];
   const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });

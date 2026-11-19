@@ -1,8 +1,13 @@
 import { createContext, useContext, useSyncExternalStore, type ReactNode } from 'react';
-import { setToken, clearToken, getToken } from '@/shared/api/http';
+import { setToken, clearToken, getToken, registerUnauthorizedHandler } from '@/shared/api/http';
+import { AUTH_ENABLED } from '@/shared/config/auth';
 
 const USERNAME_KEY = 'gena_username';
 const ROLE_KEY = 'gena_role';
+const RETURN_TO_KEY = 'gena_auth_return_to';
+const DEFAULT_RETURN_PATH = '/data_preprocessing';
+const SYNTHETIC_TOKEN = 'public';
+const SYNTHETIC_USERNAME = 'public';
 
 interface AuthState {
   token: string | null;
@@ -10,26 +15,38 @@ interface AuthState {
   role: string | null;
 }
 
-// --- Authentication temporarily hidden ---------------------------------
-// The backend currently treats every request as a "public" expert (see
-// dataset_api/auth_utils.get_current_user), so the UI runs as a synthetic
-// authenticated expert: no login is required and all expert-only features
-// stay enabled. A previously stored token/role is still honoured if present.
-//
-// To restore real authentication:
-//   1. revert this block to the original (commented) version below,
-//   2. re-enable the /login route + <RequireAuth> in app/router.tsx,
-//   3. re-enable the sign-in/out UI in app/layout.tsx.
-let state: AuthState = {
-  token: getToken() ?? 'public',
-  username: localStorage.getItem(USERNAME_KEY) ?? 'public',
-  role: localStorage.getItem(ROLE_KEY) ?? 'expert',
-};
-// let state: AuthState = {
-//   token: getToken(),
-//   username: localStorage.getItem(USERNAME_KEY),
-//   role: localStorage.getItem(ROLE_KEY),
-// };
+function buildInitialState(): AuthState {
+  if (!AUTH_ENABLED) {
+    return {
+      token: getToken() ?? 'public',
+      username: localStorage.getItem(USERNAME_KEY) ?? 'public',
+      role: localStorage.getItem(ROLE_KEY) ?? 'expert',
+    };
+  }
+  const token = getToken();
+  const username = localStorage.getItem(USERNAME_KEY);
+  const role = localStorage.getItem(ROLE_KEY);
+  if (token === SYNTHETIC_TOKEN || username === SYNTHETIC_USERNAME) {
+    clearToken();
+    localStorage.removeItem(USERNAME_KEY);
+    localStorage.removeItem(ROLE_KEY);
+    return { token: null, username: null, role: null };
+  }
+  if (!token && (username || role)) {
+    localStorage.removeItem(USERNAME_KEY);
+    localStorage.removeItem(ROLE_KEY);
+    return { token: null, username: null, role: null };
+  }
+  if (token && (!username || !role)) {
+    clearToken();
+    localStorage.removeItem(USERNAME_KEY);
+    localStorage.removeItem(ROLE_KEY);
+    return { token: null, username: null, role: null };
+  }
+  return { token, username, role };
+}
+
+let state: AuthState = buildInitialState();
 
 const listeners = new Set<() => void>();
 
@@ -46,21 +63,73 @@ function getSnapshot() {
   return state;
 }
 
+export function safeAuthReturnPath(
+  path: string | undefined | null,
+  fallback = DEFAULT_RETURN_PATH,
+): string {
+  if (!path || !path.startsWith('/') || path.startsWith('//')) return fallback;
+  if (path === '/login' || path.startsWith('/login?') || path.startsWith('/login/')) return fallback;
+  return path;
+}
+
+export function persistAuthReturnTo(path: string): void {
+  const safe = safeAuthReturnPath(path, '');
+  if (safe) sessionStorage.setItem(RETURN_TO_KEY, safe);
+}
+
+export function takeAuthReturnTo(fallback = DEFAULT_RETURN_PATH): string {
+  const stored = sessionStorage.getItem(RETURN_TO_KEY);
+  sessionStorage.removeItem(RETURN_TO_KEY);
+  return safeAuthReturnPath(stored, fallback);
+}
+
+export function isAuthSessionComplete(auth: AuthState): boolean {
+  return Boolean(
+    auth.token &&
+      auth.username &&
+      auth.token !== SYNTHETIC_TOKEN &&
+      auth.username !== SYNTHETIC_USERNAME,
+  );
+}
+
+export function resolveLoginRedirectPath(stateFrom?: string | null): string {
+  return safeAuthReturnPath(stateFrom, '') || takeAuthReturnTo();
+}
+
 export function loginAuth(token: string, username: string, role = 'user') {
   setToken(token);
   localStorage.setItem(USERNAME_KEY, username);
   localStorage.setItem(ROLE_KEY, role);
+  sessionStorage.removeItem(RETURN_TO_KEY);
   state = { token, username, role };
   emit();
 }
 
-export function logoutAuth() {
+function invalidateAuthSession(options?: { preserveReturnTo?: boolean }): void {
   clearToken();
   localStorage.removeItem(USERNAME_KEY);
   localStorage.removeItem(ROLE_KEY);
-  state = { token: null, username: null, role: null };
+  if (!options?.preserveReturnTo) {
+    sessionStorage.removeItem(RETURN_TO_KEY);
+  }
+  state = AUTH_ENABLED
+    ? { token: null, username: null, role: null }
+    : buildInitialState();
   emit();
 }
+
+function handleUnauthorizedSession(): void {
+  persistAuthReturnTo(
+    `${window.location.pathname}${window.location.search}${window.location.hash}`,
+  );
+  invalidateAuthSession({ preserveReturnTo: true });
+}
+
+export function logoutAuth() {
+  invalidateAuthSession();
+}
+
+registerUnauthorizedHandler(handleUnauthorizedSession);
 
 export function useAuthStore() {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
@@ -79,4 +148,12 @@ export function useAuth() {
 
 export function isExpert(role: string | null): boolean {
   return role === 'expert' || role === 'admin';
+}
+
+/** Localized label for a backend role code. */
+export function roleLabel(
+  role: string | null | undefined,
+  t: (key: string) => string,
+): string {
+  return isExpert(String(role ?? '')) ? t('common:roleExpert') : t('common:roleUser');
 }

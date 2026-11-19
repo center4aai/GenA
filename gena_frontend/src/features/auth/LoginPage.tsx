@@ -1,14 +1,17 @@
 import { FormEvent, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { login } from '@/shared/api/dataset';
-import { loginAuth, logoutAuth, useAuth } from './authStore';
+import { loginAuth, logoutAuth, resolveLoginRedirectPath, roleLabel, useAuth } from './authStore';
 import { PageHeader } from '@/shared/ui/PageHeader';
+import { formatUserError } from '@/shared/lib/errorMessages';
 
 export function LoginPage() {
+  const { t } = useTranslation('common');
   const auth = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const from = (location.state as { from?: string } | null)?.from ?? '/data_preprocessing';
+  const from = resolveLoginRedirectPath((location.state as { from?: string } | null)?.from);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -22,13 +25,13 @@ export function LoginPage() {
       const data = await login(username, password);
       const token = data.access_token ?? data.token;
       if (!token) {
-        setError('No token in response');
+        setError(t('common:authNoToken'));
         return;
       }
       loginAuth(token, username, data.role ?? 'user');
       navigate(from, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+      setError(formatUserError(err, t, 'login'));
     } finally {
       setLoading(false);
     }
@@ -42,19 +45,21 @@ export function LoginPage() {
 
   return (
     <div className="mx-auto max-w-md">
-      <PageHeader title="Sign in" subtitle="Access data pages, queues, and statistics." />
+      <PageHeader title={t('common:authTitle')} subtitle={t('common:authSubtitle')} />
 
       {auth.token ? (
         <div className="card mt-6 space-y-4">
-          <p className="text-green-700">Signed in as <strong>{auth.username}</strong> ({auth.role})</p>
+          <p className="text-green-700">
+            {t('common:authSignedInAs', { username: auth.username })} ({roleLabel(auth.role, t)})
+          </p>
           <button type="button" onClick={handleLogout} className="btn-secondary">
-            Logout
+            {t('common:authLogout')}
           </button>
         </div>
       ) : (
         <form onSubmit={handleLogin} className="card mt-6 space-y-4">
           <div>
-            <label className="mb-1 block text-sm font-medium">Username</label>
+            <label className="mb-1 block text-sm font-medium">{t('common:authUsername')}</label>
             <input
               className="input-field"
               value={username}
@@ -63,7 +68,7 @@ export function LoginPage() {
             />
           </div>
           <div>
-            <label className="mb-1 block text-sm font-medium">Password</label>
+            <label className="mb-1 block text-sm font-medium">{t('common:authPassword')}</label>
             <input
               type="password"
               className="input-field"
@@ -74,7 +79,7 @@ export function LoginPage() {
           </div>
           {error && <p className="text-sm text-red-600">{error}</p>}
           <button type="submit" disabled={loading} className="btn-primary w-full">
-            {loading ? 'Signing in…' : 'Login'}
+            {loading ? t('common:authSigningIn') : t('common:authLogin')}
           </button>
         </form>
       )}

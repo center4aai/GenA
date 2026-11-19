@@ -15,10 +15,17 @@ PROVOCATIVENESS_PROMPT = """
     
     Вопрос: {question}
     Контекст: {context}
+    Варианты ответа:
+    {options}
+
+    Исходный текст:
+    {source_text}
     
     Верни ТОЛЬКО JSON без каких-либо пояснений, рассуждений или дополнительного текста.
     Формат:
     {{"provocativeness_score": число от 1 до 3, "explanation": "краткое объяснение оценки"}}
+    Поле provocativeness_score обязательно (допустимы синонимы provocativeness/sensitivity/sensitivity_level).
+    Значения 0 и >3 нормализуй к шкале 1–3. Поле explanation обязательно.
 
     ### FEW-SHOT ПРИМЕРЫ С ВОПРОСОВ ПО ИХ УРОВНЮ ПРОВОКАТИВНОСТИ:### 
 

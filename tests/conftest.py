@@ -1,19 +1,16 @@
 """
-Pytest: put `gena` package on the path for `import gena` (add `gena_web/` to sys.path).
+Shared pytest helpers for the GenA test suite.
 """
 
 from __future__ import annotations
 
-import sys
+import os
 from contextlib import contextmanager
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-# Repository root: .../gena/ ; package lives in gena_web/
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_GENA_WEB = _REPO_ROOT / "gena_web"
-if str(_GENA_WEB) not in sys.path:
-    sys.path.insert(0, str(_GENA_WEB))
+# Реестр моделей создаётся при импорте agent_api и сам запускает probe: пробные
+# chat-запросы к настоящим моделям из тестов не нужны (тесты smoke задают интервал явно).
+os.environ.setdefault("MODEL_SMOKE_INTERVAL_SEC", "0")
+from unittest.mock import MagicMock, patch
 
 
 def ok_json_response(payload):
@@ -25,8 +22,8 @@ def ok_json_response(payload):
 
 
 @contextmanager
-def patch_view_http(module: str, payload=()):
-    """Patch `get/post/put/delete` in a view module (where `from gena.http import get` is used)."""
+def patch_module_http(module: str, payload=()):
+    """Patch `get/post/put/delete` on a module that imported them from an HTTP client."""
     m = ok_json_response(list(payload))
     with (
         patch(f"{module}.get", return_value=m),

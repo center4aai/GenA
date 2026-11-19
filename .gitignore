@@ -1,6 +1,8 @@
 # Data
 /data/
-/docs
+# local notes; README screenshots are tracked
+/docs/*
+!/docs/screenshots/
 /logs
 /chunker/files_test
 .secrets/
@@ -193,15 +195,10 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Streamlit
-.streamlit/
-!gena_web/gena/.streamlit/
-
-# Claude code
-CLAUDE.md
-.claude/
-.claude/settings.json
 
 # VS Code
 .vscode/
 .vscode/settings.json
+
+# TypeScript incremental build state
+*.tsbuildinfo

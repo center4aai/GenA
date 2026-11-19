@@ -1,7 +1,8 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 python-docx>=0.8.11
-PyPDF2>=3.0.1
+pypdf>=5.1.0
+pdfplumber>=0.11.0
 python-multipart>=0.0.6
 markitdown[docx,pdf]>=0.0.1a24
 lxml>=4.9.0

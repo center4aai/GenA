@@ -56,14 +56,118 @@
   }
 
   .data-table {
-    @apply min-w-full text-sm;
+    @apply w-full text-sm;
   }
 
   .data-table th {
-    @apply border-b border-slate-200 px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500;
+    @apply border-b border-slate-200 px-3 py-2 text-left text-xs font-semibold text-slate-500;
   }
 
   .data-table td {
     @apply border-b border-slate-100 px-3 py-2.5 text-slate-700;
+  }
+}
+
+/*
+ * Universal table cell behaviour. Placed outside @layer on purpose so it wins
+ * over Tailwind utility classes (a stray `truncate` / `whitespace-nowrap`):
+ * every cell in every .data-table wraps its content onto as many lines as
+ * needed and breaks long unbroken tokens (ids, underscore_names) instead of
+ * forcing the table wider than its container. Shrinking a column simply adds
+ * more lines. Columns stay drag-resizable via useResizableColumns.
+ */
+.data-table th,
+.data-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
+}
+
+/*
+ * ...but controls are not prose. Without this the rule above breaks a button
+ * label one character per line («У/д/а/л/и/т/ь») as soon as its column is
+ * narrow. Labels stay on one line; the column is sized to fit them instead.
+ */
+.data-table th button,
+.data-table td button,
+.data-table td a,
+.data-table td select,
+.data-table td input {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* Question sheet print / Save as PDF from My questions */
+@media print {
+  aside,
+  header,
+  .btn-primary,
+  .btn-secondary,
+  nav,
+  [aria-label='Language'] {
+    display: none !important;
+  }
+
+  main {
+    overflow: visible !important;
+  }
+
+  .card {
+    break-inside: avoid;
+    box-shadow: none;
+    border: 1px solid #ccc;
+  }
+}
+
+/*
+ * Printable question sheet (features/dataset-editor/PrintSheet.tsx). It is
+ * portalled into <body> because the app shell's h-screen/overflow-hidden
+ * layout clips printing to one screen; while `body.print-questions` is set,
+ * the app is hidden and only the sheet prints.
+ */
+.print-sheet {
+  display: none;
+}
+
+@media print {
+  body.print-questions > #root {
+    display: none !important;
+  }
+
+  body.print-questions .print-sheet {
+    display: block;
+    color: #000;
+    font-size: 12pt;
+    padding: 0 8mm;
+  }
+
+  .print-sheet h1 {
+    font-size: 16pt;
+    margin: 0 0 4pt;
+  }
+
+  .print-sheet h2 {
+    font-size: 14pt;
+    margin-top: 16pt;
+    break-before: page;
+  }
+
+  .print-sheet ol {
+    list-style: none;
+    padding: 0;
+    margin: 8pt 0 0;
+  }
+
+  .print-sheet .print-question {
+    break-inside: avoid;
+    margin-bottom: 10pt;
+  }
+
+  .print-sheet .print-question ul {
+    list-style: none;
+    padding-left: 16pt;
+    margin: 4pt 0 0;
   }
 }

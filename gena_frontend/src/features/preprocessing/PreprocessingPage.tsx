@@ -1,29 +1,42 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
 import {
   listDatasets,
   createDataset,
   createQueue,
+  listQueues,
   addQueueTasks,
-  saveDatasetChunks,
+  patchDatasetMetadata,
   listDatasetTasks,
   listDatasetChunks,
+  uploadDatasetDocument,
+  deleteDataset,
 } from '@/shared/api/dataset';
-import { listModels, listModelsHealth, runChunkGate, processPrompt } from '@/shared/api/agent';
-import { chunkDocument } from '@/shared/api/chunker';
-import type { ChunkResponse, Dataset, GateResult } from '@/shared/types/documents';
+import { useSelectableModels } from '@/shared/api/useSelectableModels';
+import { pickModelId } from '@/shared/lib/modelAvailability';
+import { ModelSelect } from '@/shared/ui/ModelSelect';
+import type { ChunkResponse, ChunkingMethod, Dataset, DocumentKind, GateResult, ChunkDetailed } from '@/shared/types/documents';
+import {
+  CHUNKING_METHOD_HINT_KEYS,
+  CHUNKING_METHOD_KEYS,
+  chunkingMethodsForKind,
+  effectiveChunkingMethod,
+  defaultChunkingMethodFor,
+} from '@/shared/lib/chunkingMethods';
 import {
   buildChunkResponseFromStored,
   chunkPreviewText,
   extractChunks,
+  questionTypesToGenerate,
+  storedQuestionTypes,
 } from '@/shared/lib/normalizeChunk';
-import { disabledGateResult, evaluateGatePass, gateRejectionSummary } from '@/shared/lib/gateDecision';
+import { disabledGateResult } from '@/shared/lib/gateDecision';
 import { anyActiveGeneration } from '@/shared/lib/progress';
-import { optionsDictFromGenerated, optionsToNumberedList } from '@/shared/lib/optionsFormat';
-import { formatRetryLine, formatValidationBreakdown, parseValidationDetails, parseValidationJustifications } from '@/shared/lib/validation';
-import { downloadCsv } from '@/shared/lib/extendedExport';
-import { truncIso } from '@/shared/lib/labels';
+import { queueNameSlug } from '@/shared/lib/queueName';
+import { formatTimestamp, timestampMs } from '@/shared/lib/dateTime';
+import { datasetStatusLabel, questionTypeLabel } from '@/shared/lib/labels';
 import { usePagedList } from '@/shared/lib/usePagedList';
 import { useSort } from '@/shared/lib/useSort';
 import { useResizableColumns } from '@/shared/lib/useResizableColumns';
@@ -31,11 +44,14 @@ import { PageHeader } from '@/shared/ui/PageHeader';
 import { Pagination } from '@/shared/ui/Pagination';
 import { SortableTh } from '@/shared/ui/SortableTh';
 import { StatusBanner, LoadingState } from '@/shared/ui/StatusBanner';
-const PIPELINE_MODES: Record<string, string> = {
-  generator_validator: 'Generator + validator (no gate, no refine)',
-  generator_validator_gate: 'Generator + validator + gate (no refine)',
-  full: 'Full pipeline (gate + refine)',
-};
+import { usePageTitle } from '@/shared/i18n/usePageTitle';
+import { isAppLocale, suggestDatasetName, type AppLocale } from '@/shared/i18n';
+import { isExpert, useAuth } from '@/features/auth/authStore';
+import { AUTH_ENABLED } from '@/shared/config/auth';
+
+const PIPELINE_MODE_KEYS = ['full', 'generator_validator_gate', 'generator_validator'] as const;
+
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 const QUESTION_TYPES = ['one', 'multi', 'open'] as const;
 
@@ -47,30 +63,20 @@ function pipelineRefineEnabled(mode: string) {
   return mode === 'full';
 }
 
-// Cache chunk responses by `${name}_${size}` so re-uploading the same file is instant,
-// and persist direct-processing results across navigation.
-const chunkCache = new Map<string, ChunkResponse>();
-let persistedDirectResults: DirectResult[] = [];
-
-interface DirectResult {
-  chunkId: number;
-  sourceChunk: string;
-  questionType: string;
-  task: string;
-  options: string;
-  optionsDict: Record<string, string>;
-  correctAnswer: string;
-  provocativeness: string;
-  validationScore: string;
-  validationThreshold: string;
-  validationPassed: boolean;
-  validationDetails: unknown;
-  validationJustifications: unknown;
-  retryCount: number;
-}
-
 export function PreprocessingPage() {
+  const { t, i18n } = useTranslation(['create', 'common', 'errors', 'nav']);
+  usePageTitle('create', 'nav');
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const auth = useAuth();
+  const canManageDatasets = !AUTH_ENABLED || isExpert(auth.role);
+  const locale: AppLocale = isAppLocale(i18n.language) ? i18n.language : 'en';
+
   const [selectedDsId, setSelectedDsId] = useState('');
+  // Mirrors selectedDsId for async callbacks: a chunk load that finishes after
+  // the user picked another dataset must not overwrite the newer selection.
+  const selectedDsIdRef = useRef(selectedDsId);
+  selectedDsIdRef.current = selectedDsId;
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [chunkData, setChunkData] = useState<ChunkResponse | null>(null);
   const [documentName, setDocumentName] = useState('');
@@ -79,48 +85,51 @@ export function PreprocessingPage() {
   const [questionTypes, setQuestionTypes] = useState<string[]>([...QUESTION_TYPES]);
   const [genModelId, setGenModelId] = useState('');
   const [valModelId, setValModelId] = useState('');
-  const [processingMode, setProcessingMode] = useState<'queue' | 'direct'>('queue');
   const [pipelineMode, setPipelineMode] = useState('full');
   const [ablationTesting, setAblationTesting] = useState(false);
-  const [chunking, setChunking] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const [gateProgress, setGateProgress] = useState<string | null>(null);
+  const generatingRef = useRef(false);
   const [gateSummary, setGateSummary] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   // The dataset name we launched during this session, so we stop nagging about
   // a "duplicate" name that we ourselves just created a moment ago.
   const [lastRunName, setLastRunName] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [directResults, setDirectResults] = useState<DirectResult[]>(persistedDirectResults);
-  const [savedDataset, setSavedDataset] = useState(false);
   const [showChunks, setShowChunks] = useState(false);
-  const [chunkProgress, setChunkProgress] = useState<{ done: number; total: number } | null>(null);
   const [dsSearch, setDsSearch] = useState('');
+  const [lastEnqueuedDsId, setLastEnqueuedDsId] = useState<string | null>(null);
+  const [documentKind, setDocumentKind] = useState<DocumentKind>('normative');
+  const [chunkingMethod, setChunkingMethod] = useState<ChunkingMethod>(defaultChunkingMethodFor('normative'));
+  // Until the user picks a method by hand, it follows the document kind.
+  const [methodTouched, setMethodTouched] = useState(false);
+  const chunkingMethodUsed = effectiveChunkingMethod(documentKind, chunkingMethod);
+  useEffect(() => {
+    if (!methodTouched) setChunkingMethod(defaultChunkingMethodFor(documentKind));
+  }, [documentKind, methodTouched]);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { data: datasets = [], refetch: refetchDatasets, isLoading: loadingDatasets } = useQuery({
     queryKey: ['datasets'],
-    queryFn: listDatasets,
+    queryFn: () => listDatasets(),
   });
 
-  const persistResults = (results: DirectResult[]) => {
-    persistedDirectResults = results;
-    setDirectResults(results);
+  const resetGenerationState = () => {
+    setLastRunName(null);
+    setStatusMsg(null);
+    setLastEnqueuedDsId(null);
+    setErrorMsg(null);
+    setGateSummary(null);
+    setChunkData(null);
+    setDocumentName('');
   };
 
-  const { data: models = [] } = useQuery({ queryKey: ['models'], queryFn: listModels });
-  const { data: health = [] } = useQuery({ queryKey: ['models-health'], queryFn: listModelsHealth });
+  // Only models that answer the health probe; a choice that went down falls back to the first one.
+  const { models } = useSelectableModels();
+  const effectiveGenModelId = pickModelId(models, genModelId);
+  const effectiveValModelId = pickModelId(models, valModelId);
 
-  const healthMap = useMemo(() => Object.fromEntries(health.map((h) => [h.id, h.available])), [health]);
-
-  const effectiveGenModelId = genModelId || models[0]?.id || '';
-  const effectiveValModelId = valModelId || models[0]?.id || '';
-
-  useEffect(() => {
-    if (models.length && !genModelId) setGenModelId(models[0].id);
-    if (models.length && !valModelId) setValModelId(models[0].id);
-  }, [models, genModelId, valModelId]);
-
-  // Proactive active-generation check: block generation while another run is processing.
+  // Poll datasets for in-progress work; surfaced as a non-blocking notice only.
   const { data: activeGen = { active: false, queueName: '' } } = useQuery({
     queryKey: ['active-generation', datasets.map((d) => `${d._id}:${d.metadata?.status}`).join(',')],
     queryFn: async () => {
@@ -151,19 +160,19 @@ export function PreprocessingPage() {
     effectiveRunName !== lastRunName &&
     datasets.some((d) => d.name === effectiveRunName);
 
-  const dsSort = useSort<Dataset>();
-  const dsCols = useResizableColumns({ name: 260, source: 220, id: 220 });
+  const dsSort = useSort<Dataset>({ key: 'created', dir: 'desc' });
+  const dsCols = useResizableColumns({ name: 260, source: 220, id: 220, actions: 160 });
   const dsSorted = dsSort.sortItems(datasets, {
     name: (d) => d.name,
     source: (d) => d.source_document,
     chunks: (d) => d.chunks_valid ?? 0,
-    questions: (d) => d.questions?.length ?? 0,
+    questions: (d) => d.questions_count ?? d.metadata?.total_questions_generated ?? 0,
     status: (d) => d.metadata?.status,
-    created: (d) => d.created_at,
+    created: (d) => timestampMs(d.created_at),
     id: (d) => d._id,
   });
   const dsPaged = usePagedList(dsSorted, {
-    pageSize: 8,
+    pageSize: 5,
     search: dsSearch,
     searchFields: (d) => [d.name, d.source_document, d.metadata?.status, d._id],
   });
@@ -174,65 +183,97 @@ export function PreprocessingPage() {
       return buildChunkResponseFromStored(stored);
     },
     onSuccess: (data, ds) => {
+      if (ds._id !== selectedDsIdRef.current) return;
+      const docName = ds.source_document ?? ds.name;
       setChunkData(data);
-      setDocumentName(ds.source_document ?? ds.name);
+      setDocumentName(docName);
       setDatasetName(ds.name);
       setDatasetDescription(ds.description ?? '');
       if (!data.num_chunks) {
-        setErrorMsg(`Dataset '${ds.name}' has no stored chunks. Re-run chunking on the source document.`);
+        setErrorMsg(t('create:noStoredChunks', { name: ds.name }));
+      } else {
+        setErrorMsg(null);
       }
     },
-    onError: (e) => {
+    onError: (e, ds) => {
+      if (ds._id !== selectedDsIdRef.current) return;
       setChunkData(null);
-      setErrorMsg(e instanceof Error ? e.message : 'Failed to load stored chunks');
+      setDocumentName('');
+      setErrorMsg(e instanceof Error ? e.message : t('create:loadChunksFailed'));
     },
   });
 
-  const handleFileUpload = async (file: File) => {
+  const deleteDatasetMutation = useMutation({
+    mutationFn: (ds: Dataset) => deleteDataset(ds._id),
+    onSuccess: (_data, ds) => {
+      if (selectedDsId === ds._id) {
+        setSelectedDsId('');
+        resetGenerationState();
+      }
+      setErrorMsg(null);
+      void refetchDatasets();
+    },
+    onError: (e) => {
+      setErrorMsg(e instanceof Error ? e.message : t('create:deleteFailed'));
+    },
+  });
+
+  const handleDeleteDataset = (ds: Dataset) => {
+    if (deleteDatasetMutation.isPending) return;
+    if (!window.confirm(t('create:deleteConfirm', { name: ds.name }))) return;
+    deleteDatasetMutation.mutate(ds);
+  };
+
+  const handleClearUpload = () => {
+    setUploadFile(null);
+    setDocumentName('');
+    setDatasetName('');
+    setDatasetDescription('');
+    setErrorMsg(null);
+    resetGenerationState();
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleFileUpload = (file: File) => {
     setUploadFile(file);
     setErrorMsg(null);
-    const cacheKey = `${file.name}_${file.size}`;
-    const cached = chunkCache.get(cacheKey);
-    if (cached) {
-      setChunkData(cached);
-      setDocumentName(cached.document_type?.document_name ?? file.name.replace(/\.[^.]+$/, ''));
-      setDatasetName(file.name.replace(/\.[^.]+$/, ''));
-      setDatasetDescription(`Generated from ${file.name}`);
+    resetGenerationState();
+    setSelectedDsId('');
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setErrorMsg(t('create:fileTooLarge'));
+      setUploadFile(null);
       return;
     }
-    setChunking(true);
-    try {
-      const data = await chunkDocument(file);
-      const docName =
-        data.document_type?.document_name ?? file.name.replace(/\.[^.]+$/, '');
-      chunkCache.set(cacheKey, data);
-      setChunkData(data);
-      setDocumentName(docName);
-      setDatasetName(file.name.replace(/\.[^.]+$/, ''));
-      setDatasetDescription(`Generated from ${file.name}`);
-      if (!data.num_chunks) {
-        setErrorMsg('Chunking produced 0 chunks. The document may be empty or unsupported.');
-      }
-    } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : 'Chunking failed');
-      setChunkData(null);
-    } finally {
-      setChunking(false);
-    }
+    // Chunking no longer runs on upload — it happens asynchronously in the queue
+    // after the user clicks "Generate". We just capture the file and pre-fill the
+    // dataset name/description so settings can be picked immediately.
+    const docName = file.name.replace(/\.[^.]+$/, '');
+    setDocumentName(docName);
+    setDatasetName(suggestDatasetName(file.name, locale, t('common:documentFallback')));
+    setDatasetDescription(t('create:generatedFrom', { file: file.name }));
   };
 
   const handleGenerate = async () => {
-    if (!chunkData || !chunkData.num_chunks || !questionTypes.length) return;
+    if (generatingRef.current) return;
+    if (!questionTypes.length) return;
+    // Need either a fresh upload (chunked later in the queue) or already-loaded
+    // chunk data (existing dataset).
+    if (!uploadFile && !chunkData) return;
+    const trimmedName = datasetName.trim();
+    if (!trimmedName) {
+      setErrorMsg(t('create:nameRequired'));
+      return;
+    }
     if (duplicateName) {
-      setErrorMsg(
-        `A dataset named "${effectiveRunName}" already exists. Pick a unique name or re-use the existing dataset above.`,
-      );
+      setErrorMsg(t('create:duplicateName', { name: effectiveRunName }));
       return;
     }
     setErrorMsg(null);
     setStatusMsg(null);
+    setLastEnqueuedDsId(null);
     setGateSummary(null);
     setGenerating(true);
+    generatingRef.current = true;
 
     try {
       // Running generations no longer block a new run — the queue processes
@@ -241,450 +282,344 @@ export function PreprocessingPage() {
       const gateEnabled = pipelineGateEnabled(pipelineMode);
       const datasetRunName =
         ablationTesting && !usingExisting ? `${datasetName}__${pipelineMode}` : datasetName;
-      const extracted = extractChunks(chunkData.chunks_detailed, chunkData.chunks);
+
+      // Fresh upload: chunking itself runs in the queue. Create the dataset,
+      // upload the raw file, enqueue a single "chunk" task, and send the user
+      // straight to the queue screen — no waiting for chunking here. The worker
+      // downloads the document, chunks it, then fans out gate/generation.
+      if (!usingExisting) {
+        if (!uploadFile) {
+          setErrorMsg(t('create:uploadFirst'));
+          setGenerating(false);
+          return;
+        }
+        const ts = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+        const queueNameNew = `queue_${queueNameSlug(datasetRunName)}_${ts}`;
+        const sourceName = documentName || uploadFile.name;
+        await createQueue({
+          name: queueNameNew,
+          description: t('create:queueFor', { name: datasetRunName }),
+          priority: 1,
+        });
+        const created = await createDataset({
+          name: datasetRunName,
+          description: datasetDescription,
+          source_document: sourceName,
+          questions: [],
+          metadata: {
+            ablation_testing: ablationTesting,
+            queue_name: queueNameNew,
+            pipeline_mode: pipelineMode,
+            gate_enabled: gateEnabled,
+            gate_async: true,
+            chunking_pending: true,
+            refine_enabled: pipelineRefineEnabled(pipelineMode),
+            experiment_source_document: sourceName,
+            question_types: questionTypes,
+            document_kind: documentKind,
+            chunking_method: chunkingMethodUsed,
+            num_chunks_processed: 0,
+            total_chunks: 0,
+            chunks_passed_gate: 0,
+            chunks_rejected: 0,
+            total_questions_generated: 0,
+            questions_per_chunk: questionTypes.length,
+            expected_questions: 0,
+            generation_model_id: effectiveGenModelId || undefined,
+            validation_model_id: effectiveValModelId || undefined,
+            created_at: new Date().toISOString(),
+            status: 'processing',
+          },
+        });
+        const dsId = created.dataset_id;
+        await uploadDatasetDocument(dsId, uploadFile);
+        await addQueueTasks(queueNameNew, [{
+          chunk_id: 0,
+          chunk_text: '',
+          question_type: questionTypes.includes('multi') ? 'multi' : questionTypes[0],
+          question_types: questionTypes,
+          task_type: 'chunk' as const,
+          source_document: sourceName,
+          dataset_name: datasetRunName,
+          dataset_id: dsId,
+          dataset_description: datasetDescription,
+          // Этапы разбираются по приоритету: разбивка (9) → отбор (5) → генерация (1).
+          priority: 9,
+          pipeline_mode: pipelineMode,
+          document_kind: documentKind,
+          chunking_method: chunkingMethodUsed,
+          ...(effectiveGenModelId ? { generation_model_id: effectiveGenModelId } : {}),
+          ...(effectiveValModelId ? { validation_model_id: effectiveValModelId } : {}),
+        }]);
+        setLastRunName(datasetRunName);
+        setLastEnqueuedDsId(dsId);
+        refetchDatasets();
+        // Prime the queues cache so the overview screen finds the freshly
+        // created queue immediately instead of flashing "queue not found".
+        await queryClient.fetchQuery({ queryKey: ['queues'], queryFn: listQueues }).catch(() => {});
+        setGenerating(false);
+        navigate(`/queue_overview?queue=${encodeURIComponent(queueNameNew)}`);
+        return;
+      }
+
+      // Existing dataset: reuse stored chunks / gate verdicts and enqueue generation.
+      const cd = chunkData;
+      if (!cd || !cd.num_chunks) {
+        setErrorMsg(t('create:zeroChunks'));
+        setGenerating(false);
+        return;
+      }
+      const extracted = extractChunks(cd.chunks_detailed, cd.chunks);
 
       if (!extracted.length) {
-        setErrorMsg('All chunks are empty or too short.');
+        setErrorMsg(t('create:allChunksEmpty'));
         setGenerating(false);
         return;
       }
 
-      if (processingMode === 'queue') {
-        const gateResults: Record<number, GateResult> = {};
-        let validChunks: Array<(typeof extracted)[0] & { typesOk: string[]; gate: GateResult }> = [];
-        let rejected = 0;
+      const ts = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+      const queueNameNew = `queue_${queueNameSlug(datasetRunName)}_${ts}`;
 
-        if (!gateEnabled) {
-          validChunks = extracted.map((ec) => {
-            const gate = disabledGateResult();
-            gateResults[ec.idx] = gate;
-            return { ...ec, typesOk: [...questionTypes], gate };
-          });
-          setGateSummary(`Gate disabled. Using all ${validChunks.length}/${extracted.length} chunks.`);
-        } else if (usingExisting) {
-          for (const ec of extracted) {
-            const storedTypes = ec.typesValid ?? [...questionTypes];
-            const typesOk = questionTypes.filter((qt) => storedTypes.includes(qt));
-            if (typesOk.length) {
-              const gate = (ec.gateResult as GateResult) ?? { passed: true };
-              gateResults[ec.idx] = gate;
-              validChunks.push({ ...ec, typesOk, gate });
-            }
-          }
-          rejected = extracted.length - validChunks.length;
-          setGateSummary(`${validChunks.length}/${extracted.length} chunks passed gate, ${rejected} rejected`);
-        } else {
-          const gateQtype = questionTypes.includes('multi') ? 'multi' : questionTypes[0];
-          for (let gi = 0; gi < extracted.length; gi++) {
-            const ec = extracted[gi];
-            setChunkProgress({ done: gi + 1, total: extracted.length });
-            setGateProgress(`Gate: chunk ${ec.idx} (${gi + 1}/${extracted.length})…`);
-            try {
-              const res = await runChunkGate({
-                chunk: ec.text,
-                question_type: gateQtype,
-                ...(effectiveValModelId ? { validation_model_id: effectiveValModelId } : {}),
-              });
-              gateResults[ec.idx] = res.result ?? { passed: false };
-            } catch (e) {
-              gateResults[ec.idx] = { passed: false, rejection_reason: `gate_error: ${e}` };
-            }
-          }
-          setGateProgress(null);
-          setChunkProgress(null);
+      const gateResults: Record<number, GateResult> = {};
+      let validChunks: Array<(typeof extracted)[0] & { typesOk: string[]; gate: GateResult }> = [];
+      let rejected = 0;
 
-          for (const ec of extracted) {
-            const gr = gateResults[ec.idx] ?? {};
-            const { typesOk } = evaluateGatePass(gr, questionTypes);
-            if (typesOk.length) {
-              validChunks.push({ ...ec, typesOk, gate: gr });
-            }
-          }
-          rejected = extracted.length - validChunks.length;
-          const summary = gateRejectionSummary(gateResults);
-          setGateSummary(
-            `${validChunks.length}/${extracted.length} chunks passed gate, ${rejected} rejected` +
-              (summary ? `. Rejections: ${summary}` : ''),
-          );
-        }
-
-        if (!validChunks.length) {
-          setErrorMsg('All chunks were rejected by the gate.');
-          setGenerating(false);
-          return;
-        }
-
-        const ts = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
-        const queueNameNew = `queue_${datasetRunName}_${ts}`;
-        await createQueue({ name: queueNameNew, description: `Queue for ${datasetRunName}`, priority: 1 });
-
-        const validByIdx = Object.fromEntries(validChunks.map((vc) => [vc.idx, vc]));
-        let dsId: string;
-
-        if (usingExisting && chosenDs) {
-          dsId = chosenDs._id;
-          setStatusMsg(`Re-using existing dataset '${datasetName}' (${dsId})`);
-        } else {
-          const totalTasksPlanned = validChunks.reduce((s, vc) => s + vc.typesOk.length, 0);
-          const created = await createDataset({
-            name: datasetRunName,
-            description: datasetDescription,
-            source_document: documentName,
-            questions: [],
-            metadata: {
-              ablation_testing: ablationTesting,
-              queue_name: queueNameNew,
-              pipeline_mode: pipelineMode,
-              gate_enabled: gateEnabled,
-              refine_enabled: pipelineRefineEnabled(pipelineMode),
-              experiment_source_document: documentName,
-              question_types: questionTypes,
-              num_chunks_processed: 0,
-              total_chunks: chunkData.num_chunks,
-              chunks_passed_gate: validChunks.length,
-              chunks_rejected: rejected,
-              total_questions_generated: 0,
-              questions_per_chunk: questionTypes.length,
-              expected_questions: totalTasksPlanned,
-              generation_model_id: effectiveGenModelId || undefined,
-              validation_model_id: effectiveValModelId || undefined,
-              created_at: new Date().toISOString(),
-              status: 'processing',
-            },
-          });
-          dsId = created.dataset_id;
-
-          const chunkDocs = extracted.map((ec) => {
-            const vc = validByIdx[ec.idx];
-            const gateResult =
-              vc?.gate ?? gateResults[ec.idx] ?? { passed: false, rejection_reason: 'not_selected_for_generation' };
-            return {
-              chunk_index: ec.idx,
-              chunk_text: ec.text,
-              fragment_data: ec.fragmentData,
-              gate_result: gateResult,
-              gate_passed: Boolean(vc),
-              question_types_valid: vc?.typesOk ?? [],
-            };
-          });
-          await saveDatasetChunks(dsId, chunkDocs);
-        }
-
-        const tasks = validChunks.flatMap((vc) =>
-          vc.typesOk.map((qt) => ({
-            chunk_id: vc.idx,
-            chunk_text: vc.text,
-            question_type: qt,
-            source_document: documentName,
-            dataset_name: datasetRunName,
-            dataset_id: dsId,
-            dataset_description: datasetDescription,
-            priority: 1,
-            chunk_pre_validated: true,
-            pipeline_mode: pipelineMode,
-            ...(effectiveGenModelId ? { generation_model_id: effectiveGenModelId } : {}),
-            ...(effectiveValModelId ? { validation_model_id: effectiveValModelId } : {}),
-          })),
-        );
-
-        const tr = await addQueueTasks(queueNameNew, tasks);
-        setLastRunName(datasetRunName);
-        setStatusMsg(`Added ${tr.tasks_added} tasks to queue '${queueNameNew}'. Open Queue Manager to monitor.`);
-        refetchDatasets();
+      if (!gateEnabled) {
+        validChunks = extracted.map((ec) => {
+          const gate = disabledGateResult();
+          gateResults[ec.idx] = gate;
+          return { ...ec, typesOk: [...questionTypes], gate };
+        });
+        setGateSummary(t('create:gateDisabledSummary', { valid: validChunks.length, total: extracted.length }));
       } else {
-        const totalQuestions = chunkData.num_chunks * questionTypes.length;
-        const results: DirectResult[] = [];
-        let counter = 0;
-        const items = chunkData.chunks_detailed ?? chunkData.chunks ?? [];
-
-        for (let idx = 0; idx < items.length; idx++) {
-          const chunkText = chunkPreviewText(items[idx] as never);
-          for (const qt of questionTypes) {
-            counter++;
-            setChunkProgress({ done: counter, total: totalQuestions });
-            setGateProgress(`Processing chunk ${idx + 1}/${chunkData.num_chunks}, type ${qt} (${counter}/${totalQuestions})…`);
-            try {
-              const res = await processPrompt({
-                prompt: chunkText,
-                question_type: qt,
-                source: 'user_input',
-                chat_id: 12345,
-                source_text: chunkText,
-                pipeline_mode: pipelineMode,
-                ...(effectiveGenModelId ? { generation_model_id: effectiveGenModelId } : {}),
-                ...(effectiveValModelId ? { validation_model_id: effectiveValModelId } : {}),
-                ...(usingExisting ? { chunk_pre_validated: true } : {}),
-              });
-              const output = (res.result?.output ?? {}) as Record<string, unknown>;
-              if (output.chunk_rejected) continue;
-
-              const gq = (output.generated_question ?? {}) as Record<string, unknown>;
-              const sensitivity = (output.sensitivity_score ?? {}) as Record<string, unknown>;
-              const validation = (output.validation_result ?? {}) as Record<string, unknown>;
-
-              results.push({
-                chunkId: idx + 1,
-                sourceChunk: chunkText,
-                questionType: String(output.question_type ?? qt),
-                task: String(gq.task ?? ''),
-                options: optionsToNumberedList(gq),
-                optionsDict: optionsDictFromGenerated(gq),
-                correctAnswer: String(gq.outputs ?? 'N/A'),
-                provocativeness: String(sensitivity.provocativeness_score ?? 'N/A'),
-                validationScore: `${validation.total ?? 'N/A'}/${validation.max_total ?? 'N/A'}`,
-                validationThreshold: String(validation.threshold ?? 'N/A'),
-                validationPassed: Boolean(validation.passed),
-                validationDetails: validation.by_block,
-                validationJustifications: validation.justifications,
-                retryCount: Number(output.retry_count ?? 0),
-              });
-            } catch (e) {
-              results.push({
-                chunkId: idx + 1,
-                sourceChunk: chunkText,
-                questionType: qt,
-                task: `Error: ${e instanceof Error ? e.message : 'unknown'}`,
-                options: '',
-                optionsDict: {},
-                correctAnswer: '',
-                provocativeness: '',
-                validationScore: 'N/A',
-                validationThreshold: 'N/A',
-                validationPassed: false,
-                validationDetails: {},
-                validationJustifications: {},
-                retryCount: 0,
-              });
-            }
+        for (const ec of extracted) {
+          const typesOk = questionTypesToGenerate(ec, questionTypes, true);
+          if (typesOk.length) {
+            const gate = (ec.gateResult as GateResult) ?? { passed: true };
+            gateResults[ec.idx] = gate;
+            validChunks.push({ ...ec, typesOk, gate });
           }
         }
-        persistResults(results);
-        setChunkProgress(null);
-        setGateProgress(null);
-        setStatusMsg('Direct processing completed.');
+        rejected = extracted.length - validChunks.length;
+        setGateSummary(t('create:gatePassedSummary', {
+          valid: validChunks.length,
+          total: extracted.length,
+          rejected,
+        }));
       }
-    } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : 'Generation failed');
-    } finally {
-      setGenerating(false);
-    }
-  };
 
-  const handleSaveDirect = async () => {
-    if (!directResults.length) return;
-    const datasetRunName =
-      ablationTesting && !usingExisting ? `${datasetName}__${pipelineMode}` : datasetName;
-    try {
-      const questions = directResults.map((item) => ({
-        chunk_id: item.chunkId,
-        source_chunk: item.sourceChunk,
-        question_type: item.questionType,
-        task: item.task,
-        options: item.optionsDict,
-        correct_answer: item.correctAnswer,
-        provocativeness: item.provocativeness,
-        validation_score: item.validationScore,
-        validation_threshold: item.validationThreshold,
-        validation_passed: String(item.validationPassed),
-        validation_details:
-          typeof item.validationDetails === 'string'
-            ? item.validationDetails
-            : JSON.stringify(item.validationDetails ?? {}),
-        validation_justifications:
-          typeof item.validationJustifications === 'string'
-            ? item.validationJustifications
-            : JSON.stringify(item.validationJustifications ?? {}),
-        retry_count: String(item.retryCount),
-      }));
-      const res = await createDataset({
-        name: datasetRunName,
-        description: datasetDescription,
-        source_document: documentName,
-        questions,
-        metadata: {
-          ablation_testing: ablationTesting,
-          pipeline_mode: pipelineMode,
-          gate_enabled: pipelineGateEnabled(pipelineMode),
-          refine_enabled: pipelineRefineEnabled(pipelineMode),
-          question_types: questionTypes,
-          experiment_source_document: documentName,
-          total_chunks: chunkData?.num_chunks,
-          num_chunks_processed: chunkData?.num_chunks ?? 0,
-          questions_per_chunk: questionTypes.length,
-          total_questions_generated: directResults.length,
-          generation_model_id: effectiveGenModelId || undefined,
-          validation_model_id: effectiveValModelId || undefined,
-          generated_at: new Date().toISOString(),
-        },
+      if (!validChunks.length) {
+        setErrorMsg(t('create:allChunksRejected'));
+        setGenerating(false);
+        return;
+      }
+
+      await createQueue({
+        name: queueNameNew,
+        description: t('create:queueFor', { name: datasetRunName }),
+        priority: 1,
       });
-      setSavedDataset(true);
-      setStatusMsg(`Dataset saved! ID: ${res.dataset_id}`);
+
+      const dsId = chosenDs!._id;
+      const totalTasksPlanned = validChunks.reduce((s, vc) => s + vc.typesOk.length, 0);
+      await patchDatasetMetadata(dsId, {
+        status: 'processing',
+        queue_name: queueNameNew,
+        pipeline_mode: pipelineMode,
+        gate_enabled: gateEnabled,
+        refine_enabled: pipelineRefineEnabled(pipelineMode),
+        question_types: questionTypes,
+        document_kind: documentKind,
+        total_chunks: cd.num_chunks,
+        chunks_passed_gate: validChunks.length,
+        chunks_rejected: rejected,
+        total_questions_generated: 0,
+        expected_questions: totalTasksPlanned,
+        generation_model_id: effectiveGenModelId || undefined,
+        validation_model_id: effectiveValModelId || undefined,
+        last_updated: new Date().toISOString(),
+      });
+      setStatusMsg(t('create:reusingDataset', { name: datasetName, id: dsId }));
+
+      const tasks = validChunks.flatMap((vc) =>
+        vc.typesOk.map((qt) => ({
+          chunk_id: vc.idx,
+          chunk_text: vc.text,
+          question_type: qt,
+          source_document: documentName,
+          dataset_name: datasetRunName,
+          dataset_id: dsId,
+          dataset_description: datasetDescription,
+          priority: 1,
+          document_kind: documentKind,
+          ...(storedQuestionTypes(vc, questionTypes).includes(qt)
+            ? { chunk_pre_validated: true }
+            : {}),
+          pipeline_mode: pipelineMode,
+          ...(effectiveGenModelId ? { generation_model_id: effectiveGenModelId } : {}),
+          ...(effectiveValModelId ? { validation_model_id: effectiveValModelId } : {}),
+        })),
+      );
+
+      await addQueueTasks(queueNameNew, tasks);
+      setLastRunName(datasetRunName);
+      setLastEnqueuedDsId(dsId);
       refetchDatasets();
+      await queryClient.fetchQuery({ queryKey: ['queues'], queryFn: listQueues }).catch(() => {});
+      setGenerating(false);
+      navigate(`/queue_overview?queue=${encodeURIComponent(queueNameNew)}`);
     } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : 'Save failed');
+      setErrorMsg(e instanceof Error ? e.message : t('create:generationFailed'));
+    } finally {
+      generatingRef.current = false;
+      setGenerating(false);
     }
   };
 
   const hasData = chunkData != null && (chunkData.num_chunks ?? 0) > 0;
   const previewItems = chunkData?.chunks_detailed ?? chunkData?.chunks ?? [];
+  // A fresh upload is enough to configure + generate — chunking happens later in
+  // the queue, so we no longer wait for chunk data before showing settings.
+  const hasUpload = Boolean(uploadFile) && !usingExisting;
+  const showConfig = hasUpload || hasData;
 
-  if (loadingDatasets) return <LoadingState label="Loading datasets…" />;
+  if (loadingDatasets) return <LoadingState label={t('create:loadingDatasets')} />;
+
+  const pipelineModeLabel = (mode: string) => {
+    if (mode === 'full') return t('create:pipelineFull');
+    if (mode === 'generator_validator_gate') return t('create:pipelineGate');
+    return t('create:pipelineNoGate');
+  };
 
   return (
     <div>
       <PageHeader
-        title="Data Preprocessing"
-        subtitle="Select an existing dataset or upload a new document, choose question types, and generate a dataset. Results will appear in Results & Editor."
+        title={t('create:title')}
+        subtitle={t('create:subtitle')}
       />
-
-      <div className="mb-4 flex gap-4 text-sm">
-        <Link to="/" className="text-gena-primary hover:underline">Home</Link>
-        <Link to="/docs" className="text-gena-primary hover:underline">Documentation</Link>
-      </div>
-
-      <hr className="my-6" />
-
-      <h2 className="text-lg font-semibold">Existing Datasets</h2>
-      {datasets.length ? (
-        <>
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
-            <input
-              type="search"
-              className="input-field max-w-xs"
-              placeholder="Search datasets…"
-              value={dsSearch}
-              onChange={(e) => { setDsSearch(e.target.value); dsPaged.setPage(1); }}
-            />
-            <Pagination
-              page={dsPaged.page}
-              totalPages={dsPaged.totalPages}
-              total={dsPaged.total}
-              onPageChange={dsPaged.setPage}
-              label="datasets"
-            />
-          </div>
-          <div className="mt-2 w-full overflow-x-auto rounded-xl border border-slate-200 bg-white">
-            <table className="data-table" ref={dsCols.tableRef} style={dsCols.tableStyle}>
-              <thead>
-                <tr>
-                  <SortableTh label="Name" sortKey="name" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} className="w-64" />
-                  <SortableTh label="Source" sortKey="source" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                  <SortableTh label="Chunks" sortKey="chunks" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                  <SortableTh label="Questions" sortKey="questions" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                  <SortableTh label="Status" sortKey="status" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                  <SortableTh label="Created" sortKey="created" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                  <SortableTh label="ID" sortKey="id" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
-                </tr>
-              </thead>
-              <tbody>
-                {dsPaged.pageItems.map((ds) => (
-                  <tr key={ds._id}>
-                    <td className="align-top font-medium">
-                      <div className="whitespace-normal break-words" title={ds.name}>{ds.name}</div>
-                    </td>
-                    <td className="whitespace-normal break-words align-top" title={ds.source_document}>{ds.source_document}</td>
-                    <td className="whitespace-nowrap">
-                      {ds.chunks_valid ?? 0}/{ds.chunks_count ?? ds.metadata?.total_chunks ?? 0}
-                    </td>
-                    <td>{ds.questions?.length ?? 0}</td>
-                    <td>{ds.metadata?.status ?? '—'}</td>
-                    <td className="whitespace-nowrap text-xs text-slate-500">{truncIso(ds.created_at)}</td>
-                    <td className="whitespace-normal break-all align-top font-mono text-xs text-slate-400" title={ds._id}>{ds._id}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <label className="mt-4 block text-sm font-medium">Use an existing dataset</label>
-          <select
-            className="input-field mt-1 max-w-xl"
-            value={selectedDsId}
-            onChange={(e) => {
-              const id = e.target.value;
-              setSelectedDsId(id);
-              const ds = datasets.find((d) => d._id === id);
-              if (ds) {
-                loadExistingChunks.mutate(ds);
-              } else {
-                setChunkData(null);
-              }
-            }}
-          >
-            <option value="">— none (upload new) —</option>
-            {dsPaged.filteredItems.map((ds) => (
-              <option key={ds._id} value={ds._id}>
-                {ds.name} ({ds.source_document})
-              </option>
-            ))}
-          </select>
-        </>
-      ) : (
-        <p className="mt-2 text-slate-600">No datasets found. Upload a document below.</p>
-      )}
-
-      <hr className="my-6" />
 
       {usingExisting && chosenDs ? (
         <div className="space-y-4">
           <p className="rounded-lg bg-green-50 p-3 text-green-800">
-            Using existing dataset: <strong>{datasetName}</strong> (source: {documentName})
+            {t('create:usingExisting', { name: datasetName, source: documentName })}
           </p>
-          {loadExistingChunks.isPending && <p className="text-sm text-slate-500">Loading chunks…</p>}
+          {loadExistingChunks.isPending && <p className="text-sm text-slate-500">{t('create:loadingChunks')}</p>}
           <div>
-            <label className="text-sm font-medium">Dataset Name</label>
+            <label className="text-sm font-medium">{t('create:datasetName')}</label>
             <input className="input-field mt-1" value={datasetName} onChange={(e) => setDatasetName(e.target.value)} />
           </div>
           <div>
-            <label className="text-sm font-medium">Description</label>
+            <label className="text-sm font-medium">{t('create:description')}</label>
             <textarea className="input-field mt-1" rows={2} value={datasetDescription} onChange={(e) => setDatasetDescription(e.target.value)} />
           </div>
         </div>
       ) : (
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-lg font-semibold">Upload a new document</h2>
-            <button
-              type="button"
-              className="text-sm text-gena-primary hover:underline"
-              onClick={() => {
-                const sample = [
-                  'Example Document',
-                  '',
-                  'This is an example document for GenA. Replace this text with your own',
-                  'content (.docx, .txt or .pdf). The chunker will split it into fragments,',
-                  'and the pipeline will generate and validate questions for each chunk.',
-                ].join('\n');
-                const blob = new Blob([sample], { type: 'text/plain;charset=utf-8' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'example_document.txt';
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-            >
-              Download example document
-            </button>
+            <h2 className="text-lg font-semibold">{t('create:uploadNew')}</h2>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                className="text-sm font-medium text-gena-primary hover:underline"
+                onClick={() => {
+                  void (async () => {
+                    try {
+                      const res = await fetch('/samples/example_document.txt');
+                      if (!res.ok) throw new Error('sample missing');
+                      const text = await res.text();
+                      const file = new File([text], 'example_document.txt', { type: 'text/plain' });
+                      handleFileUpload(file);
+                    } catch {
+                      setErrorMsg(t('create:chunkingFailed'));
+                    }
+                  })();
+                }}
+              >
+                {t('create:tryExample')}
+              </button>
+              <button
+                type="button"
+                className="text-sm text-slate-600 hover:underline"
+                onClick={() => {
+                  const a = document.createElement('a');
+                  a.href = '/samples/example_document.txt';
+                  a.download = 'example_document.txt';
+                  a.click();
+                }}
+              >
+                {t('create:downloadExample')}
+              </button>
+            </div>
           </div>
-          <input
-            type="file"
-            accept=".docx,.txt,.pdf"
-            className="block w-full cursor-pointer rounded-lg border border-slate-300 text-sm text-slate-600 file:mr-4 file:cursor-pointer file:border-0 file:bg-gena-primary file:px-4 file:py-2.5 file:text-sm file:font-medium file:text-white hover:file:bg-gena-primary-dark"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void handleFileUpload(f);
+          <div
+            className={`relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-8 text-center transition-colors ${
+              dragActive
+                ? 'border-gena-primary bg-gena-primary/5'
+                : 'border-slate-300 bg-white hover:border-gena-primary/60'
+            }`}
+            onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragActive(true); }}
+            onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); setDragActive(true); }}
+            onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); setDragActive(false); }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setDragActive(false);
+              const f = e.dataTransfer.files?.[0];
+              if (f) handleFileUpload(f);
             }}
-          />
-          {uploadFile && <p className="text-green-700">File uploaded: {uploadFile.name}</p>}
-          {chunking && <p className="text-sm">Splitting document into chunks…</p>}
-          {hasData && (
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".docx,.txt,.pdf"
+              className="absolute inset-0 cursor-pointer opacity-0"
+              aria-label={t('create:chooseFile')}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFileUpload(f);
+              }}
+            />
+            <p className="text-sm font-medium text-slate-800">
+              {dragActive ? t('create:dropzoneActive') : t('create:dropzoneHint')}
+            </p>
+            <p className="mt-1 text-xs text-slate-500">{t('create:dropzoneFormats')}</p>
+            {uploadFile ? (
+              <p className="relative z-10 mt-3 flex items-center justify-center gap-2 text-sm text-emerald-700">
+                <span>{uploadFile.name}</span>
+                <button
+                  type="button"
+                  className="rounded px-1.5 text-base leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+                  aria-label={t('create:removeFile')}
+                  title={t('create:removeFile')}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleClearUpload();
+                  }}
+                >
+                  ×
+                </button>
+              </p>
+            ) : (
+              <p className="mt-3 text-xs text-slate-400">{t('create:noFileChosen')}</p>
+            )}
+          </div>
+          {uploadFile && <p className="text-green-700">{t('create:fileUploaded', { name: uploadFile.name })}</p>}
+          {hasUpload && (
             <>
               <div>
-                <label className="text-sm font-medium">Dataset Name</label>
+                <label className="text-sm font-medium">{t('create:datasetName')}</label>
                 <input className="input-field mt-1" value={datasetName} onChange={(e) => setDatasetName(e.target.value)} />
+                {duplicateName && (
+                  <div className="mt-2">
+                    <StatusBanner tone="warning">
+                      {t('create:duplicateName', { name: effectiveRunName })}
+                    </StatusBanner>
+                  </div>
+                )}
               </div>
               <div>
-                <label className="text-sm font-medium">Description</label>
+                <label className="text-sm font-medium">{t('create:description')}</label>
                 <textarea className="input-field mt-1" rows={2} value={datasetDescription} onChange={(e) => setDatasetDescription(e.target.value)} />
               </div>
             </>
@@ -692,24 +627,168 @@ export function PreprocessingPage() {
         </div>
       )}
 
-      {hasData && (
+      {!hasUpload && (
         <>
-          <button type="button" className="mt-4 text-sm text-gena-primary" onClick={() => setShowChunks(!showChunks)}>
-            {showChunks ? 'Hide' : 'Preview'} chunks ({chunkData!.num_chunks})
-          </button>
-          {showChunks && (
-            <div className="mt-2 max-h-96 space-y-2 overflow-y-auto">
-              {previewItems.slice(0, 50).map((ch, i) => (
-                <div key={i} className="card text-xs">
-                  <div className="font-medium">Chunk {i + 1}</div>
-                  <pre className="mt-1 whitespace-pre-wrap">{chunkPreviewText(ch as never)}</pre>
+          <hr className="my-6" />
+          {datasets.length ? (
+            <details className="rounded-xl border border-slate-200 bg-white p-4">
+              <summary className="cursor-pointer font-semibold text-slate-800">
+                {t('create:existingDatasets')}
+              </summary>
+              <div className="mt-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <input
+                      type="search"
+                      className="input-field max-w-xs"
+                      placeholder={t('create:searchDatasets')}
+                      value={dsSearch}
+                      onChange={(e) => { setDsSearch(e.target.value); dsPaged.setPage(1); }}
+                    />
+                    <Pagination
+                      page={dsPaged.page}
+                      totalPages={dsPaged.totalPages}
+                      total={dsPaged.total}
+                      onPageChange={dsPaged.setPage}
+                      countLabel={(n) => t('common:datasets', { count: n })}
+                    />
+                  </div>
+                  <div className="mt-2 w-full overflow-x-auto rounded-xl border border-slate-200 bg-white">
+                    <table className="data-table" ref={dsCols.tableRef} style={dsCols.tableStyle}>
+                      <thead>
+                        <tr>
+                          <SortableTh label={t('create:colName')} sortKey="name" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} className="w-64" />
+                          <SortableTh label={t('create:colSource')} sortKey="source" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
+                          <SortableTh label={t('create:colChunks')} sortKey="chunks" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
+                          <SortableTh label={t('create:colQuestions')} sortKey="questions" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
+                          <SortableTh label={t('create:colStatus')} sortKey="status" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
+                          <SortableTh label={t('create:colCreated')} sortKey="created" sort={dsSort.sort} onSort={dsSort.requestSort} resize={dsCols} />
+                          {canManageDatasets && (
+                            <th
+                              data-col="actions"
+                              className="text-left"
+                              style={
+                                dsCols.widthFor('actions') != null
+                                  ? {
+                                      width: dsCols.widthFor('actions'),
+                                      maxWidth: dsCols.widthFor('actions'),
+                                    }
+                                  : undefined
+                              }
+                            >
+                              {t('create:colActions')}
+                            </th>
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {dsPaged.pageItems.map((ds) => (
+                          <tr key={ds._id}>
+                            <td className="align-top font-medium">
+                              <div className="whitespace-normal break-words" title={ds.name}>{ds.name}</div>
+                            </td>
+                            <td className="whitespace-normal break-words align-top" title={ds.source_document}>{ds.source_document}</td>
+                            <td className="whitespace-nowrap">
+                              {ds.chunks_valid ?? 0}/{ds.chunks_count ?? ds.metadata?.total_chunks ?? 0}
+                            </td>
+                            <td>{ds.questions_count ?? ds.metadata?.total_questions_generated ?? 0}</td>
+                            <td>{datasetStatusLabel(ds.metadata?.status, t)}</td>
+                            <td className="whitespace-nowrap text-slate-500">{formatTimestamp(ds.created_at)}</td>
+                            {canManageDatasets && (
+                              <td className="whitespace-nowrap align-top">
+                                <button
+                                  type="button"
+                                  className="text-xs font-medium text-red-700 hover:underline disabled:opacity-50"
+                                  disabled={deleteDatasetMutation.isPending}
+                                  onClick={() => handleDeleteDataset(ds)}
+                                >
+                                  {t('create:deleteDataset')}
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <label className="mt-4 block text-sm font-medium">{t('create:useExisting')}</label>
+                  <select
+                    className="input-field mt-1 max-w-xl"
+                    value={selectedDsId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setSelectedDsId(id);
+                      setErrorMsg(null);
+                      resetGenerationState();
+                      setUploadFile(null);
+                      if (fileInputRef.current) fileInputRef.current.value = '';
+                      const ds = datasets.find((d) => d._id === id);
+                      if (ds) {
+                        const kind = ds.metadata?.document_kind;
+                        if (kind === 'textbook' || kind === 'encyclopedia' || kind === 'normative') {
+                          setDocumentKind(kind);
+                        } else {
+                          setDocumentKind('normative');
+                        }
+                        loadExistingChunks.mutate(ds);
+                      } else {
+                        setDocumentKind('normative');
+                      }
+                    }}
+                  >
+                    <option value="">{t('create:noneUploadNew')}</option>
+                    {dsPaged.filteredItems.map((ds) => {
+                      const chunkTotal = ds.chunks_count ?? ds.metadata?.total_chunks ?? 0;
+                      const empty = chunkTotal === 0;
+                      return (
+                        <option key={ds._id} value={ds._id} disabled={empty}>
+                          {ds.name} ({ds.source_document})
+                          {empty ? ` ${t('create:noChunksSuffix')}` : ''}
+                        </option>
+                      );
+                    })}
+                  </select>
+              </div>
+            </details>
+          ) : (
+            <p className="mt-2 text-slate-600">{t('create:noDatasets')}</p>
+          )}
+        </>
+      )}
+
+      {showConfig && (
+        <>
+          {hasData && (
+            <>
+              <button type="button" className="mt-4 text-sm text-gena-primary" onClick={() => setShowChunks(!showChunks)}>
+                {showChunks
+                  ? t('create:hideChunks', { count: chunkData!.num_chunks })
+                  : t('create:previewChunks', { count: chunkData!.num_chunks })}
+              </button>
+              {showChunks && (
+                <div className="mt-2 max-h-96 space-y-2 overflow-y-auto">
+                  {previewItems.slice(0, 50).map((ch, i) => {
+                    const chunkIdx =
+                      typeof ch === 'object' && ch !== null
+                        ? (ch as ChunkDetailed)._chunk_index
+                          ?? (() => {
+                            const m = (ch as ChunkDetailed).fragment_id?.match(/_chunk_(\d+)$/);
+                            return m ? Number(m[1]) : i + 1;
+                          })()
+                        : i + 1;
+                    return (
+                    <div key={chunkIdx} className="card text-xs">
+                      <div className="font-medium">{t('create:chunkLabel', { n: chunkIdx })}</div>
+                      <pre className="mt-1 whitespace-pre-wrap">{chunkPreviewText(ch as never)}</pre>
+                    </div>
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
+              )}
+            </>
           )}
 
           <hr className="my-6" />
-          <h3 className="font-semibold">Question Types</h3>
+          <h3 className="font-semibold">{t('create:questionTypes')}</h3>
           <div className="mt-2 flex flex-wrap gap-3">
             {QUESTION_TYPES.map((qt) => (
               <label key={qt} className="flex items-center gap-2 text-sm">
@@ -722,220 +801,145 @@ export function PreprocessingPage() {
                     );
                   }}
                 />
-                {qt}
+                {questionTypeLabel(qt)}
               </label>
             ))}
           </div>
           {questionTypes.length === 0 && (
-            <p className="mt-2 text-sm text-amber-700">
-              Please select at least one question type — the Generate button stays disabled until you do.
-            </p>
+            <p className="mt-2 text-sm text-amber-700">{t('create:selectTypeHint')}</p>
           )}
 
-          {models.length > 0 && (
-            <>
-              <hr className="my-6" />
-              <h3 className="font-semibold">Model Selection</h3>
-              <div className="mt-2 grid gap-4 sm:grid-cols-2">
-                <div>
-                  <label className="text-sm">Generation model</label>
-                  <select
-                    className="input-field mt-1"
-                    value={effectiveGenModelId}
-                    onChange={(e) => setGenModelId(e.target.value)}
-                  >
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {!healthMap[m.id] ? '⚠ ' : ''}{m.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-sm">Validation model</label>
-                  <select
-                    className="input-field mt-1"
-                    value={effectiveValModelId}
-                    onChange={(e) => setValModelId(e.target.value)}
-                  >
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {!healthMap[m.id] ? '⚠ ' : ''}{m.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </>
-          )}
-
-          <hr className="my-6" />
-          <div className="space-y-3">
-            <div>
-              <span className="text-sm font-medium">Processing Mode</span>
-              <div className="mt-1 flex gap-4">
-                <label className="text-sm">
-                  <input type="radio" checked={processingMode === 'queue'} onChange={() => setProcessingMode('queue')} /> Queue Mode (Recommended)
-                </label>
-                <label className="text-sm">
-                  <input type="radio" checked={processingMode === 'direct'} onChange={() => setProcessingMode('direct')} /> Direct Processing
-                </label>
-              </div>
-            </div>
-            <div>
-              <label className="text-sm font-medium">Pipeline Mode</label>
-              <select className="input-field mt-1 max-w-xl" value={pipelineMode} onChange={(e) => setPipelineMode(e.target.value)}>
-                {Object.entries(PIPELINE_MODES).map(([k, v]) => (
-                  <option key={k} value={k}>{v}</option>
-                ))}
-              </select>
-              <p className="mt-1 text-xs text-slate-500">
-                Gate: {pipelineGateEnabled(pipelineMode) ? 'enabled' : 'disabled'}; refine:{' '}
-                {pipelineRefineEnabled(pipelineMode) ? 'enabled' : 'disabled'}.
-              </p>
-            </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={ablationTesting} onChange={(e) => setAblationTesting(e.target.checked)} />
-              Ablation testing run
-            </label>
+          <div className="mt-6">
+            <label className="text-sm font-medium">{t('create:documentKind')}</label>
+            <select
+              className="input-field mt-1 max-w-xl"
+              value={documentKind}
+              onChange={(e) => setDocumentKind(e.target.value as DocumentKind)}
+            >
+              <option value="normative">{t('create:kindNormative')}</option>
+              <option value="textbook">{t('create:kindTextbook')}</option>
+              <option value="encyclopedia">{t('create:kindEncyclopedia')}</option>
+            </select>
           </div>
 
-          {duplicateName && !activeGen.active && (
-            <div className="mt-4">
-              <StatusBanner tone="warning">
-                A dataset named <strong>{effectiveRunName}</strong> already exists, so generation is
-                blocked to avoid duplicates. Pick a unique name, or re-use the existing dataset from
-                the “Use an existing dataset” list above to append to it.
+          <div className="mt-4">
+            <label className="text-sm font-medium">{t('create:chunkingMethod')}</label>
+            <select
+              className="input-field mt-1 max-w-xl"
+              value={chunkingMethodUsed}
+              disabled={chunkingMethodsForKind(documentKind).length === 1}
+              onChange={(e) => {
+                setMethodTouched(true);
+                setChunkingMethod(e.target.value as ChunkingMethod);
+              }}
+            >
+              {chunkingMethodsForKind(documentKind).map((m) => (
+                <option key={m} value={m}>{t(CHUNKING_METHOD_KEYS[m])}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-slate-500">
+              {chunkingMethodsForKind(documentKind).length === 1
+                ? t('create:methodOnlyRulesForNormative')
+                : t(CHUNKING_METHOD_HINT_KEYS[chunkingMethodUsed])}
+            </p>
+          </div>
+
+          <details className="mt-6 rounded-xl border border-slate-200 bg-white p-4">
+            <summary className="cursor-pointer font-semibold text-slate-800">
+              {t('create:advancedSettings')}
+            </summary>
+            <div className="mt-4 space-y-4">
+              {models.length > 0 && (
+                <div>
+                  <h3 className="font-medium">{t('create:modelSelection')}</h3>
+                  <div className="mt-2 grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <label className="text-sm">{t('create:generationModel')}</label>
+                      <ModelSelect models={models} value={effectiveGenModelId} onChange={setGenModelId} />
+                    </div>
+                    <div>
+                      <label className="text-sm">{t('create:validationModel')}</label>
+                      <ModelSelect models={models} value={effectiveValModelId} onChange={setValModelId} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="text-sm font-medium">{t('create:pipelineMode')}</label>
+                <select className="input-field mt-1 max-w-xl" value={pipelineMode} onChange={(e) => setPipelineMode(e.target.value)}>
+                  {PIPELINE_MODE_KEYS.map((k) => (
+                    <option key={k} value={k}>{pipelineModeLabel(k)}</option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-slate-500">
+                  {t('create:gateEnabled', {
+                    state: pipelineGateEnabled(pipelineMode) ? t('create:enabled') : t('create:disabled'),
+                  })}
+                  ;{' '}
+                  {t('create:refineEnabled', {
+                    state: pipelineRefineEnabled(pipelineMode) ? t('create:enabled') : t('create:disabled'),
+                  })}
+                  .
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={ablationTesting} onChange={(e) => setAblationTesting(e.target.checked)} />
+                {t('create:ablation')}
+              </label>
+            </div>
+          </details>
+
+          {activeGen.active && (
+            <div className="mt-6">
+              <StatusBanner tone="info">
+                {t('create:activeGeneration', {
+                  queue: activeGen.queueName
+                    ? t('create:activeQueue', { name: activeGen.queueName })
+                    : '',
+                })}{' '}
+                <Link to="/queue_manager" className="underline">{t('create:openProgress')}</Link>
               </StatusBanner>
             </div>
           )}
 
-          {activeGen.active ? (
-            <div className="mt-6">
-              <StatusBanner tone="info">
-                Generation in progress{activeGen.queueName ? ` (queue: ${activeGen.queueName})` : ''}.
-                The Generate button is hidden until it finishes — tasks are processed in the
-                background queue.{' '}
-                <Link to="/queue_manager" className="underline">Open Queue Manager →</Link>
-              </StatusBanner>
-            </div>
-          ) : (
-            <button
-              type="button"
-              className="btn-primary mt-6"
-              disabled={!questionTypes.length || generating || duplicateName}
-              onClick={() => void handleGenerate()}
-            >
-              {generating ? 'Generating…' : 'Generate Questions'}
-            </button>
-          )}
+          <button
+            type="button"
+            className="btn-primary mt-6"
+            disabled={
+              !questionTypes.length ||
+              generating ||
+              duplicateName ||
+              !datasetName.trim() ||
+              loadExistingChunks.isPending ||
+              (usingExisting && (!chunkData || !(chunkData.num_chunks ?? 0)))
+            }
+            onClick={() => void handleGenerate()}
+          >
+            {generating ? t('create:generating') : t('create:generate')}
+          </button>
         </>
       )}
 
-      {chunkProgress && (
-        <div className="mt-4">
-          <div className="mb-1 flex justify-between text-xs text-slate-500">
-            <span>Progress</span>
-            <span>{chunkProgress.done}/{chunkProgress.total}</span>
-          </div>
-          <div className="h-2 overflow-hidden rounded-full bg-slate-100">
-            <div
-              className="h-full bg-gena-primary transition-all"
-              style={{ width: `${chunkProgress.total ? (chunkProgress.done / chunkProgress.total) * 100 : 0}%` }}
-            />
-          </div>
-        </div>
-      )}
-
-      {gateProgress && <p className="mt-4 text-sm text-slate-600">{gateProgress}</p>}
       {gateSummary && <div className="mt-4"><StatusBanner tone="info">{gateSummary}</StatusBanner></div>}
       {statusMsg && <div className="mt-4"><StatusBanner tone="success">{statusMsg}</StatusBanner></div>}
-      {errorMsg && <div className="mt-4"><StatusBanner tone="error">{errorMsg}</StatusBanner></div>}
-      {statusMsg?.includes('queue') && (
-        <Link to="/queue_manager" className="mt-2 inline-block text-gena-primary hover:underline">
-          Open Queue Manager →
-        </Link>
-      )}
-
-      {directResults.length > 0 && (
-        <div className="mt-8 space-y-6">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <h3 className="text-lg font-semibold">Direct Processing Results</h3>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() =>
-                downloadCsv(
-                  `${effectiveRunName || 'direct_results'}.csv`,
-                  directResults.map((r) => ({
-                    chunk_id: r.chunkId,
-                    question_type: r.questionType,
-                    task: r.task,
-                    options: r.options,
-                    correct_answer: r.correctAnswer,
-                    provocativeness: r.provocativeness,
-                    validation_score: r.validationScore,
-                    validation_threshold: r.validationThreshold,
-                    validation_passed: r.validationPassed,
-                    retry_count: r.retryCount,
-                    source_chunk: r.sourceChunk,
-                  })),
-                )
-              }
-            >
-              Download Results (CSV)
-            </button>
-          </div>
-          {Object.entries(
-            directResults.reduce<Record<number, DirectResult[]>>((acc, r) => {
-              (acc[r.chunkId] ??= []).push(r);
-              return acc;
-            }, {}),
-          ).map(([chunkId, items]) => (
-            <div key={chunkId} className="card">
-              <h4 className="font-semibold">Chunk #{chunkId}</h4>
-              {items.map((item, i) => (
-                <div key={i} className="mt-4 border-t pt-4">
-                  <p className="text-sm text-slate-500">Question {i + 1} ({item.questionType})</p>
-                  <p><strong>Task:</strong> {item.task}</p>
-                  <pre className="mt-1 text-sm">{item.options}</pre>
-                  <p><strong>Correct:</strong> {item.correctAnswer}</p>
-                  <p className="text-sm text-slate-600">Provocativeness: {item.provocativeness}</p>
-                  <p className="text-sm">
-                    Validation: {item.validationScore}
-                    {item.validationThreshold && item.validationThreshold !== 'N/A'
-                      ? ` (threshold ${item.validationThreshold})`
-                      : ''}{' '}
-                    — {item.validationPassed ? 'PASSED' : 'FAILED'}
-                  </p>
-                  <p className="text-xs text-slate-500">{formatRetryLine(item.retryCount)}</p>
-                  {item.sourceChunk && (
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-xs font-medium text-slate-600">Source chunk</summary>
-                      <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-slate-50 p-2 text-xs">{item.sourceChunk}</pre>
-                    </details>
-                  )}
-                  {Boolean(item.validationDetails) && (
-                    <ul className="mt-2 text-xs text-slate-600">
-                      {formatValidationBreakdown(
-                        parseValidationDetails(item.validationDetails),
-                        parseValidationJustifications(item.validationJustifications),
-                      ).map((line, li) => (
-                        <li key={li}>{line}</li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              ))}
-            </div>
-          ))}
-          {!savedDataset && (
-            <button type="button" className="btn-primary" onClick={() => void handleSaveDirect()}>
-              Save Dataset to Database
-            </button>
-          )}
+      {lastEnqueuedDsId && (
+        <div className="mt-2 flex flex-wrap gap-4">
+          <Link
+            to={`/dataset_editor?dataset=${lastEnqueuedDsId}`}
+            className="text-gena-primary hover:underline"
+          >
+            {t('create:openResults')}
+          </Link>
+          <Link
+            to="/queue_manager"
+            className="text-gena-primary hover:underline"
+          >
+            {t('create:openProgress')}
+          </Link>
         </div>
       )}
+      {errorMsg && <div className="mt-4"><StatusBanner tone="error">{errorMsg}</StatusBanner></div>}
     </div>
   );
 }

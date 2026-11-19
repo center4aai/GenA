@@ -1,43 +1,53 @@
-from typing import Literal, Dict, Optional, TypedDict, List, Union
-from pydantic import BaseModel, Field
+import logging
+from typing import Optional, TypedDict
+
+from pydantic import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import Runnable
-from langchain_core.output_parsers import JsonOutputParser
-import json
 
-from llm_factory import create_chat_llm
+from llm_factory import TRANSIENT_LLM_ERRORS, create_chat_llm
 from agent.nodes.assess_sensitivity.system_prompt import PROVOCATIVENESS_PROMPT
+from agent.schemas.question import (
+    StructuredQuestionOutput,
+    serialize_question_options,
+    fence_user_content,
+    format_question_context,
+)
+from agent.llm_parsing import parse_assessment_model
 
-
-class StructuredQuestionOutput(BaseModel):
-    task: str = Field(description="Текст вопроса.")
-    text: Optional[str] = Field(
-        default=None, description="Дополнительный контекст вопроса."
-    )
-    option_1: Optional[str] = Field(default=None, description="Вариант ответа 1.")
-    option_2: Optional[str] = Field(default=None, description="Вариант ответа 2.")
-    option_3: Optional[str] = Field(default=None, description="Вариант ответа 3.")
-    option_4: Optional[str] = Field(default=None, description="Вариант ответа 4.")
-    option_5: Optional[str] = Field(default=None, description="Вариант ответа 5.")
-    option_6: Optional[str] = Field(default=None, description="Вариант ответа 6.")
-    option_7: Optional[str] = Field(default=None, description="Вариант ответа 7.")
-    option_8: Optional[str] = Field(default=None, description="Вариант ответа 8.")
-    option_9: Optional[str] = Field(default=None, description="Вариант ответа 9.")
-    outputs: Union[int, str] = Field(
-        description="Правильный ответ: для типов 'one' - номер варианта (1-9), 'multi' - номера через запятую без пробелов (например, '1,3'), 'open' - текст ответа."
-    )
+logger = logging.getLogger(__name__)
 
 
 class ProvocativenessInput(TypedDict):
     generated_question: StructuredQuestionOutput
+    source_text: Optional[str]
 
 
 class ProvocativenessOutput(BaseModel):
-    provocativeness_score: int = Field(
-        description="Оценка провокационности вопроса по 3-балльной шкале", ge=1, le=3
+    # None + assessment_failed=True — оценка не состоялась (парсинг, невалидный
+    # вход, нетранзиентная ошибка LLM). Раньше сюда подставлялась fail-closed
+    # «3», и воркер сохранял её как настоящую оценку.
+    provocativeness_score: Optional[int] = Field(
+        default=None,
+        description="Оценка провокационности вопроса по 3-балльной шкале",
+        ge=1,
+        le=3,
     )
-    explanation: str = Field(description="Краткое объяснение оценки провокационности")
+    explanation: Optional[str] = Field(
+        default=None, description="Краткое объяснение оценки провокационности"
+    )
+    assessment_failed: bool = False
+    assessment_error: Optional[str] = None
+
+
+def _failed_assessment(error: str) -> ProvocativenessOutput:
+    return ProvocativenessOutput(
+        provocativeness_score=None,
+        explanation=None,
+        assessment_failed=True,
+        assessment_error=str(error)[:300],
+    )
 
 
 def create_provocativeness_chain(
@@ -59,48 +69,66 @@ def create_provocativeness_chain(
         api_key=api_key,
         temperature=0.0,
         max_tokens=256,
-        timeout=90,
         **provider_kwargs,
     )
 
-    parser = JsonOutputParser(pydantic_object=ProvocativenessOutput)
+    # Используется parse_assessment_model как источник значений по умолчанию:
+    # score None означает «поле отсутствует», а не подставленную оценку.
+    fallback = _failed_assessment("score missing in LLM response")
 
     class ProvocativenessRunnable(
         Runnable[ProvocativenessInput, ProvocativenessOutput]
     ):
         def invoke(self, input_data: ProvocativenessInput) -> ProvocativenessOutput:
-            question_data = input_data["generated_question"]
-            question_data = StructuredQuestionOutput(**question_data)
+            raw_question = input_data["generated_question"]
+            try:
+                if isinstance(raw_question, StructuredQuestionOutput):
+                    question_data = raw_question
+                else:
+                    question_data = StructuredQuestionOutput(**raw_question)
+            except (ValidationError, TypeError, ValueError) as exc:
+                logger.warning("Invalid question payload for sensitivity assessment: %s", exc)
+                return _failed_assessment(f"invalid question payload: {exc}")
 
-            prompt = system_prompt.format(
+            source_text = (
+                (input_data.get("source_text") or "").strip()
+                or (question_data.source_text or "").strip()
+            )
+            options_text = serialize_question_options(question_data)
+
+            system_content = system_prompt.format(
                 question=question_data.task,
-                context=(
-                    question_data.text
-                    if question_data.text
-                    else "Нет дополнительного контекста"
+                context=format_question_context(question_data.text),
+                options=options_text,
+                source_text=fence_user_content(
+                    source_text or "(не указан)", "SOURCE_TEXT"
                 ),
             )
-            # Создаем цепочку обработки
-            prompt = ChatPromptTemplate.from_messages([
-                SystemMessage(content=prompt),
+            chat_prompt = ChatPromptTemplate.from_messages([
+                SystemMessage(content=system_content),
                 HumanMessage(content="Выполни оценку провокационности."),
             ])
-            chain = prompt | llm | parser
-            result = chain.invoke({})
-            # JsonOutputParser может вернуть словарь или объект Pydantic модели
-            if isinstance(result, dict):
-                return ProvocativenessOutput(**result)
-            elif isinstance(result, ProvocativenessOutput):
-                return result
-            else:
-                # Если результат - это что-то другое, пытаемся преобразовать
-                if hasattr(result, "model_dump"):
-                    return ProvocativenessOutput(**result.model_dump())
-                elif hasattr(result, "dict"):
-                    return ProvocativenessOutput(**result.dict())
-                else:
-                    raise ValueError(
-                        f"Unexpected result type: {type(result)}, value: {result}"
-                    )
+            try:
+                response = (chat_prompt | llm).invoke({})
+                raw = response.content if hasattr(response, "content") else str(response)
+            except TRANSIENT_LLM_ERRORS:
+                # Таймаут/503/429/auth — не вердикт по содержанию; пусть долетит
+                # до API и станет 5xx/401, чтобы очередь повторила задачу.
+                raise
+            except Exception as exc:
+                logger.warning("Sensitivity assessment LLM call failed: %s", exc)
+                return _failed_assessment(f"llm call failed: {exc}")
+
+            parsed = parse_assessment_model(
+                raw,
+                ProvocativenessOutput,
+                "provocativeness_score",
+                fallback,
+                score_aliases=("provocativeness", "sensitivity", "sensitivity_level"),
+            )
+            if parsed.provocativeness_score is None:
+                logger.warning("Sensitivity assessment returned no usable score")
+                return fallback
+            return parsed
 
     return ProvocativenessRunnable()

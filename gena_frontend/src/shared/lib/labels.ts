@@ -1,33 +1,45 @@
 import type { CategoryDatum } from '../ui/charts';
+import i18n from '@/shared/i18n';
 
-const QUESTION_TYPE_LABELS: Record<string, string> = {
-  one: 'Single Choice',
-  one_choice: 'Single Choice',
-  single: 'Single Choice',
-  multi: 'Multiple Choice',
-  multiple: 'Multiple Choice',
-  multiple_choice: 'Multiple Choice',
-  open: 'Open Question',
-  open_question: 'Open Question',
+export type Translate = (key: string, opts?: Record<string, unknown>) => string;
+
+const QUESTION_TYPE_KEYS: Record<string, string> = {
+  one: 'create:typeOne',
+  one_choice: 'create:typeOne',
+  single: 'create:typeOne',
+  multi: 'create:typeMulti',
+  multiple: 'create:typeMulti',
+  multiple_choice: 'create:typeMulti',
+  open: 'create:typeOpen',
+  open_question: 'create:typeOpen',
 };
 
-const LEVEL_LABELS: Record<string, string> = {
-  '1': 'Low',
-  '2': 'Medium',
-  '3': 'High',
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
+const LEVEL_KEYS: Record<string, string> = {
+  '1': 'results:levelLow',
+  '2': 'results:levelMedium',
+  '3': 'results:levelHigh',
+  low: 'results:levelLow',
+  medium: 'results:levelMedium',
+  high: 'results:levelHigh',
 };
 
-export function questionTypeLabel(value: unknown): string {
-  const key = String(value ?? '').trim().toLowerCase();
-  return QUESTION_TYPE_LABELS[key] ?? (key ? key : 'unknown');
+function resolveT(t?: Translate): Translate {
+  if (t) return t;
+  return (key, opts) => String(i18n.t(key, opts as never));
 }
 
-export function levelLabel(value: unknown): string {
+export function questionTypeLabel(value: unknown, t?: Translate): string {
   const key = String(value ?? '').trim().toLowerCase();
-  return LEVEL_LABELS[key] ?? (key ? key : 'unknown');
+  const i18nKey = QUESTION_TYPE_KEYS[key];
+  if (i18nKey) return resolveT(t)(i18nKey);
+  return key || 'unknown';
+}
+
+export function levelLabel(value: unknown, t?: Translate): string {
+  const key = String(value ?? '').trim().toLowerCase();
+  const i18nKey = LEVEL_KEYS[key];
+  if (i18nKey) return resolveT(t)(i18nKey);
+  return key || 'unknown';
 }
 
 /** Convert a {label: count} record to a sorted CategoryDatum array. */
@@ -51,14 +63,43 @@ export function toCategoryData(
   return entries.map(([label, value]) => ({ label, value }));
 }
 
-/** ISO timestamp truncated to seconds (matches Python str(dt)[:19]). */
-export function truncIso(value: unknown): string {
-  const s = String(value ?? '');
-  return s ? s.slice(0, 19).replace('T', ' ') : '';
+/**
+ * Human-readable queue name: strip leading `queue_` and trailing
+ * `_YYYYMMDDHHMMSS` (and repeated timestamp suffixes). Full technical name
+ * should still be available via tooltip/`title`.
+ */
+export function humanQueueName(name: unknown): string {
+  let s = String(name ?? '').trim();
+  if (!s) return '';
+  if (s.startsWith('queue_')) s = s.slice(6);
+  // Strip one or more trailing _YYYYMMDD[_HHMMSS] / _YYYYMMDDHHMMSS suffixes.
+  for (let i = 0; i < 3; i += 1) {
+    const next = s.replace(/_(\d{8})(_?\d{6})?$/, '');
+    if (next === s) break;
+    s = next;
+  }
+  return s || String(name);
 }
 
-/** Date portion of an ISO timestamp (YYYY-MM-DD). */
-export function isoDate(value: unknown): string {
-  const s = String(value ?? '');
-  return s ? s.slice(0, 10) : '';
+/** Map a dataset/queue status code to a localized label. */
+export function datasetStatusLabel(status: unknown, t: Translate): string {
+  const key = String(status ?? '').trim().toLowerCase();
+  switch (key) {
+    case 'processing':
+      return t('create:statusProcessing');
+    case 'completed':
+      return t('create:statusCompleted');
+    case 'no_valid_chunks':
+      return t('create:statusNoValidChunks');
+    case 'failed':
+      return t('create:statusFailed');
+    case 'completed_with_failures':
+      return t('create:statusCompletedWithFailures');
+    case 'in_progress':
+      return t('create:statusInProgress');
+    case 'pending':
+      return t('create:statusPending');
+    default:
+      return key || t('common:none');
+  }
 }
